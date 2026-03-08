@@ -2,7 +2,6 @@
 
 import json
 import pytest
-from app.settings.config import settings
 from pathlib import Path
 
 # Path to demo database for tests requiring data sources
@@ -15,26 +14,26 @@ CHINOOK_DB_PATH = (Path(__file__).resolve().parent.parent.parent / "demo-datasou
 
 @pytest.mark.e2e
 def test_mcp_requires_api_key(test_client, create_user, login_user):
-    """Verify MCP endpoints reject requests without valid API key."""
+    """Verify MCP endpoints reject requests without valid auth with 401 + WWW-Authenticate."""
     # Setup user to ensure DB is populated
     user = create_user()
     login_user(user["email"], user["password"])
 
-    # Without any API key, get 400 (org ID missing - checked before auth)
+    # Without any API key, get 401 with WWW-Authenticate header
     response = test_client.get("/api/mcp")
-    assert response.status_code == 400
-    assert "organization" in response.json()["detail"].lower()
+    assert response.status_code == 401
+    assert "www-authenticate" in {k.lower(): v for k, v in response.headers.items()}
 
     # POST endpoint without API key
     response = test_client.post(
         "/api/mcp",
         json={"jsonrpc": "2.0", "id": 1, "method": "initialize"}
     )
-    assert response.status_code == 400
+    assert response.status_code == 401
 
     # REST tools endpoint without API key
     response = test_client.get("/api/mcp/tools")
-    assert response.status_code == 400
+    assert response.status_code == 401
 
 
 @pytest.mark.e2e
@@ -50,7 +49,7 @@ def test_mcp_rejects_invalid_api_key(test_client, create_user, login_user):
         headers={"X-API-Key": "bow_invalid_key_that_does_not_exist"}
     )
     assert response.status_code == 401
-    assert "invalid" in response.json()["detail"].lower() or "expired" in response.json()["detail"].lower()
+    assert "not authenticated" in response.json()["detail"].lower()
 
 
 @pytest.mark.e2e
@@ -212,8 +211,8 @@ def test_mcp_get_server_info(
     assert data["jsonrpc"] == "2.0"
     assert "result" in data
     result = data["result"]
-    assert result["protocolVersion"] == "2024-11-05"
-    assert result["serverInfo"]["name"] == settings.brand_config.mcp_client_key_name
+    assert result["protocolVersion"] == "2025-11-25"
+    assert result["serverInfo"]["name"] == "bagofwords"
     assert result["serverInfo"]["version"] == "1.0.0"
     assert "capabilities" in result
     assert "tools" in result["capabilities"]
@@ -251,8 +250,8 @@ def test_mcp_initialize(
     assert data["id"] == 42
     assert "result" in data
     result = data["result"]
-    assert result["protocolVersion"] == "2024-11-05"
-    assert result["serverInfo"]["name"] == settings.brand_config.mcp_client_key_name
+    assert result["protocolVersion"] == "2025-11-25"
+    assert result["serverInfo"]["name"] == "bagofwords"
     assert "capabilities" in result
 
 
@@ -289,7 +288,7 @@ def test_mcp_tools_list(
     assert "tools" in data["result"]
 
     tools = data["result"]["tools"]
-    assert len(tools) == 8
+    assert len(tools) == 10
 
     tool_names = [t["name"] for t in tools]
     assert "create_report" in tool_names
@@ -300,6 +299,9 @@ def test_mcp_tools_list(
     assert "list_instructions" in tool_names
     assert "create_instruction" in tool_names
     assert "delete_instruction" in tool_names
+    # App-only tools (hidden from LLM, used by MCP App UIs)
+    assert "get_visualization" in tool_names
+    assert "get_artifact_data" in tool_names
 
     # Verify each tool has required fields
     for tool in tools:
@@ -307,6 +309,12 @@ def test_mcp_tools_list(
         assert "description" in tool
         assert "inputSchema" in tool
         assert isinstance(tool["inputSchema"], dict)
+
+    # Verify app-only tools have correct visibility metadata
+    app_only_tools = [t for t in tools if t["name"] in ("get_visualization", "get_artifact_data")]
+    for tool in app_only_tools:
+        assert "_meta" in tool
+        assert tool["_meta"]["ui"]["visibility"] == ["app"]
 
 
 @pytest.mark.e2e
@@ -407,7 +415,7 @@ def test_mcp_rest_tools_endpoint(
     assert "tools" in data
 
     tools = data["tools"]
-    assert len(tools) == 8
+    assert len(tools) == 10
 
     tool_names = [t["name"] for t in tools]
     assert "create_report" in tool_names
@@ -418,6 +426,9 @@ def test_mcp_rest_tools_endpoint(
     assert "list_instructions" in tool_names
     assert "create_instruction" in tool_names
     assert "delete_instruction" in tool_names
+    # App-only tools
+    assert "get_visualization" in tool_names
+    assert "get_artifact_data" in tool_names
 
 
 # ============================================================================
