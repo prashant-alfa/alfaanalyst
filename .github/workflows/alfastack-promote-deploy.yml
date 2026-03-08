@@ -103,7 +103,7 @@ jobs:
         run: |
           SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
           echo "Fast-forward promotion failed; forcing production to source SHA $SOURCE_SHA"
-          git branch -f production "$SOURCE_SHA"
+          git reset --hard "$SOURCE_SHA"
           git push origin production --force-with-lease
 
       - name: Promote source to production (force sync)
