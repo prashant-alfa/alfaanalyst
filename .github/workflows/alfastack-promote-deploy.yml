@@ -89,12 +89,22 @@ jobs:
           fi
 
       - name: Promote source to production (fast-forward)
+        id: promote_ff
         if: inputs.force_sync_production == false
+        continue-on-error: true
         run: |
           SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
           git checkout -B production origin/production
           git merge --ff-only "$SOURCE_SHA"
           git push origin production
+
+      - name: Promote source to production (force sync fallback)
+        if: inputs.force_sync_production == false && steps.promote_ff.outcome == 'failure'
+        run: |
+          SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
+          echo "Fast-forward promotion failed; forcing production to source SHA $SOURCE_SHA"
+          git branch -f production "$SOURCE_SHA"
+          git push origin production --force-with-lease
 
       - name: Promote source to production (force sync)
         if: inputs.force_sync_production == true
