@@ -1,0 +1,106 @@
+name: Alfastack Daily Upstream Sync
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      auto_push:
+        description: "Push sync branch to origin"
+        type: boolean
+        default: true
+      auto_pr:
+        description: "Open PR from sync branch to development"
+        type: boolean
+        default: true
+      run_tests:
+        description: "Run backend sync test gate"
+        type: boolean
+        default: true
+      run_frontend_build:
+        description: "Run frontend-custom build gate"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  daily-sync:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: alfastack-daily-sync
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep rsync
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_versioned.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: frontend-custom/yarn.lock
+
+      - name: Install frontend-custom dependencies
+        working-directory: ./frontend-custom
+        run: |
+          npm install --global yarn@1.22.22
+          yarn install --frozen-lockfile
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure upstream remote
+        run: |
+          git remote add upstream https://github.com/bagofwords1/bagofwords.git || true
+          git remote set-url upstream https://github.com/bagofwords1/bagofwords.git
+
+      - name: Prepare local branches
+        run: |
+          git fetch origin main development production --prune
+          git checkout -B main origin/main
+          git checkout -B development origin/development
+
+      - name: Run daily sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTO_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.auto_push || 'true' }}
+          AUTO_PR: ${{ github.event_name == 'workflow_dispatch' && inputs.auto_pr || 'true' }}
+          RUN_TESTS: ${{ github.event_name == 'workflow_dispatch' && inputs.run_tests || 'true' }}
+          RUN_FRONTEND_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.run_frontend_build || 'true' }}
+          MAIN_BRANCH: main
+          DEV_BRANCH: development
+          SYNC_MODE: rebuild
+          CUSTOM_SOURCE_BRANCH: development
+          SOFT_FAIL: "false"
+        run: ./scripts/sync/daily_upstream_sync.sh
+
+      - name: Upload daily report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-sync-report
+          path: |
+            reports/daily-sync/*.md
+            documents/alfastack-automation-context.md

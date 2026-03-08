@@ -73,7 +73,6 @@ from app.routes import (
     build,
     connection,
     artifact,
-    oauth_server,
 )
 from app.routes.oidc_auth import router as oidc_auth_router
 from app.ee.routes import router as enterprise_router
@@ -200,8 +199,6 @@ app.include_router(user_data_source_credentials.router, prefix="/api")
 app.include_router(mentions.router, prefix="/api")
 app.include_router(api_key.router, prefix="/api")
 app.include_router(mcp.router, prefix="/api")
-app.include_router(oauth_server.well_known_router)  # /.well-known/* at root
-app.include_router(oauth_server.router, prefix="/api")  # /api/oauth/*
 app.include_router(connection.router, prefix="/api")
 app.include_router(artifact.router, prefix="/api")
 app.include_router(enterprise_router, prefix="/api")
@@ -214,7 +211,7 @@ def custom_openapi():
     openapi_schema = get_openapi(
         title=settings.PROJECT_NAME,
         version=settings.PROJECT_VERSION,
-        description="Bag of Words API",
+        description=f"{settings.PROJECT_NAME} API",
         routes=app.routes,
     )
 
@@ -353,7 +350,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=int(os.getenv("PORT", 8000)),
         reload=True,
         workers=20
     )
