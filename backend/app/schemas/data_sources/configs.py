@@ -72,7 +72,6 @@ class SQLCredentials(BaseModel):
         description="Leave blank to use anonymous database access or empty password.",
         json_schema_extra={"ui:type": "password"},
     )
-    ssl: bool = Field(False, title="Enable SSL", description="Use secure connection", json_schema_extra={"ui:type": "boolean"})
 
     @model_validator(mode="after")
     def validate_user_password(cls, model: "SQLCredentials") -> "SQLCredentials":
@@ -221,6 +220,16 @@ class MariadbConfig(SQLConfig):
 
 class MssqlConfig(SQLConfig):
     port: int = Field(1433, ge=1, le=65535, title="Port", description="", json_schema_extra={"ui:type": "number"})
+    schema: Optional[str] = Field(
+        None,
+        title="Schema",
+        description="Optional schema or comma-separated list of schemas",
+        json_schema_extra={"ui:type": "string"}
+    )
+
+
+class SybaseConfig(SQLConfig):
+    port: int = Field(2638, ge=1, le=65535, title="Port", description="", json_schema_extra={"ui:type": "number"})
 
 
 # Presto
@@ -554,6 +563,49 @@ class PowerBIConfig(BaseModel):
     pass
 
 
+# Microsoft Fabric
+class MSFabricCredentials(BaseModel):
+    tenant_id: str = Field(
+        ...,
+        title="Tenant ID",
+        description="Azure AD Tenant ID (Directory ID)",
+        json_schema_extra={"ui:type": "string"}
+    )
+    client_id: str = Field(
+        ...,
+        title="Client ID",
+        description="Azure AD App Registration Client ID",
+        json_schema_extra={"ui:type": "string"}
+    )
+    client_secret: str = Field(
+        ...,
+        title="Client Secret",
+        description="Azure AD App Registration Secret",
+        json_schema_extra={"ui:type": "password"}
+    )
+
+
+class MSFabricConfig(BaseModel):
+    server_hostname: str = Field(
+        ...,
+        title="Server Hostname",
+        description="Fabric SQL endpoint (e.g., abc123.datawarehouse.fabric.microsoft.com)",
+        json_schema_extra={"ui:type": "string"}
+    )
+    database: str = Field(
+        ...,
+        title="Database",
+        description="Warehouse or Lakehouse name",
+        json_schema_extra={"ui:type": "string"}
+    )
+    schema: Optional[str] = Field(
+        None,
+        title="Schema",
+        description="Optional schema or comma-separated list of schemas. If empty, all schemas will be discovered.",
+        json_schema_extra={"ui:type": "string"}
+    )
+
+
 # QVD Files (QlikView Data)
 class QVDCredentials(BaseModel):
     """No credentials needed - file system access only."""
@@ -567,6 +619,37 @@ class QVDConfig(BaseModel):
         title="File Paths",
         description="QVD file paths or glob patterns (one per line). e.g., /data/*.qvd",
         json_schema_extra={"ui:type": "textarea"}
+    )
+
+
+# Timbr Semantic Layer
+class TimbrTokenCredentials(BaseModel):
+    api_key: str = Field(
+        ...,
+        title="API Key",
+        description="Timbr API key for authentication",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class TimbrConfig(BaseModel):
+    host: str = Field(
+        ...,
+        title="Host",
+        description="Timbr server URL (e.g., https://mytimbr.example.com)",
+        json_schema_extra={"ui:type": "string"},
+    )
+    ontology: str = Field(
+        ...,
+        title="Ontology",
+        description="Name of the Timbr knowledge graph / ontology to connect to",
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify SSL certificate when connecting",
+        json_schema_extra={"ui:type": "boolean"},
     )
 
 
@@ -629,4 +712,12 @@ __all__ = [
     # QVD Files
     "QVDCredentials",
     "QVDConfig",
+    # Microsoft Fabric
+    "MSFabricCredentials",
+    "MSFabricConfig",
+    # Sybase SQL Anywhere
+    "SybaseConfig",
+    # Timbr
+    "TimbrTokenCredentials",
+    "TimbrConfig",
 ]
