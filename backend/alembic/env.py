@@ -88,7 +88,12 @@ def get_db_url():
         return settings.TEST_DATABASE_URL
     else:
         db = settings.bow_config.database
-        raw_url = db.get_url()
+        if hasattr(db, "get_url"):
+            raw_url = db.get_url()
+        elif hasattr(db, "url"):
+            raw_url = db.url
+        else:
+            raise AttributeError("Database config must define either get_url() or url")
         url = make_url(raw_url)
         if url.drivername.startswith('postgres'):
             return url.set(drivername="postgresql")
@@ -134,12 +139,14 @@ def _attach_migration_iam_hook(engine):
     if settings.TESTING:
         return
     db_config = settings.bow_config.database
-    if not db_config.uses_iam_auth:
+    if not getattr(db_config, "uses_iam_auth", False):
         return
     provider = get_auth_provider(db_config)
-    host = db_config.host
-    port = db_config.port
-    username = db_config.username
+    host = getattr(db_config, "host", None)
+    port = getattr(db_config, "port", None)
+    username = getattr(db_config, "username", None)
+    if not host or not port or not username:
+        return
 
     @event.listens_for(engine, "do_connect")
     def inject_token(dialect, conn_rec, cargs, cparams):
@@ -152,10 +159,11 @@ def run_migrations_online() -> None:
     db_config = settings.bow_config.database
 
     connect_args = {}
-    if not settings.TESTING and db_config.uses_iam_auth and db_config.auth.ssl_mode:
+    ssl_mode = getattr(getattr(db_config, "auth", None), "ssl_mode", "")
+    if not settings.TESTING and getattr(db_config, "uses_iam_auth", False) and ssl_mode:
         import os
-        connect_args["sslmode"] = db_config.auth.ssl_mode
-        if db_config.auth.ssl_mode == "verify-full":
+        connect_args["sslmode"] = ssl_mode
+        if ssl_mode == "verify-full":
             rds_ca = "/app/certs/rds-combined-ca-bundle.pem"
             if os.path.exists(rds_ca):
                 connect_args["sslrootcert"] = rds_ca
