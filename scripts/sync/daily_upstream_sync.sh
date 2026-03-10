@@ -16,7 +16,7 @@ UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
 ORIGIN_REMOTE="${ORIGIN_REMOTE:-origin}"
 SYNC_MODE="${SYNC_MODE:-merge}"
 CUSTOM_SOURCE_BRANCH="${CUSTOM_SOURCE_BRANCH:-$DEV_BRANCH}"
-MANAGED_PATHS_FILE="${MANAGED_PATHS_FILE:-$ROOT_DIR/branding/managed-paths.txt}"
+MANAGED_PATHS_FILE="${MANAGED_PATHS_FILE:-branding/managed-paths.txt}"
 
 AUTO_PUSH="${AUTO_PUSH:-false}"
 AUTO_PR="${AUTO_PR:-false}"
@@ -28,6 +28,16 @@ WORKTREE_REEXEC="${WORKTREE_REEXEC:-false}"
 SOFT_FAIL="${SOFT_FAIL:-false}"
 
 mkdir -p "$REPORT_DIR"
+
+# Normalize to repo-relative so temp-clone re-exec and git tree lookups are stable.
+if [[ "$MANAGED_PATHS_FILE" == /* ]]; then
+  if [[ "$MANAGED_PATHS_FILE" == "$ROOT_DIR/"* ]]; then
+    MANAGED_PATHS_FILE="${MANAGED_PATHS_FILE#$ROOT_DIR/}"
+  else
+    echo "MANAGED_PATHS_FILE must be repo-relative or inside repo root: $MANAGED_PATHS_FILE" >&2
+    exit 1
+  fi
+fi
 
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "$ALLOW_DIRTY_WORKTREE" == "true" && "$WORKTREE_REEXEC" != "true" ]]; then
@@ -144,7 +154,8 @@ count_changed_files() {
     echo "0"
     return
   fi
-  printf '%s\n' "$files" | rg -e "$regex" | wc -l | tr -d ' '
+  # Avoid pipefail exits when there are zero matches.
+  printf '%s\n' "$files" | awk -v re="$regex" '$0 ~ re { c++ } END { print c + 0 }'
 }
 
 build_commit_classification() {
@@ -420,7 +431,7 @@ TELEMETRY_STATUS="$(awk '
 ' bow-config.yaml | head -n1)"
 
 if [[ "$RUN_TESTS" == "true" ]]; then
-  if (cd backend && TESTING=true ENVIRONMENT=production pytest -q tests/e2e/test_mcp.py >/tmp/alfastack-daily-pytest.log 2>&1); then
+  if (cd backend && TESTING=true ENVIRONMENT=production BOW_SMTP_PORT="${BOW_SMTP_PORT:-587}" pytest -q tests/e2e/test_mcp.py >/tmp/alfastack-daily-pytest.log 2>&1); then
     TEST_RESULTS="PASS (backend/tests/e2e/test_mcp.py)"
     test_output="$(cat /tmp/alfastack-daily-pytest.log)"
   else
@@ -567,3 +578,12 @@ $build_output
 EOF
 
 echo "Daily sync completed. Report: $REPORT_PATH"
+
+if [[ "$GATE_FAILED" == "true" ]]; then
+  if [[ "$SOFT_FAIL" == "true" ]]; then
+    echo "One or more gates failed; SOFT_FAIL=true so exiting successfully."
+    exit 0
+  fi
+  echo "One or more gates failed; failing daily sync run."
+  exit 1
+fi

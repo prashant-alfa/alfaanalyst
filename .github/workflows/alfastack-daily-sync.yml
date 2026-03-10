@@ -94,6 +94,7 @@ jobs:
           SYNC_MODE: rebuild
           CUSTOM_SOURCE_BRANCH: development
           SOFT_FAIL: "false"
+          BOW_SMTP_PORT: "587"
         run: ./scripts/sync/daily_upstream_sync.sh
 
       - name: Upload daily report
