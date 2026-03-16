@@ -39,6 +39,7 @@ from app.schemas.git_repository_schema import (
     GitRepositorySchema,
 )
 from app.core.telemetry import telemetry
+from app.settings.config import settings
 
 
 logger = logging.getLogger(__name__)
@@ -914,7 +915,7 @@ class GitService:
             
             # Check if there are changes to commit
             if repo.is_dirty() or repo.untracked_files:
-                commit_message = f"BOW #{build.build_number}"
+                commit_message = f"{settings.PROJECT_NAME} #{build.build_number}"
                 if build.title:
                     commit_message += f": {build.title}"
                 repo.index.commit(commit_message)
@@ -929,7 +930,7 @@ class GitService:
                 pr_url = None
                 if create_pr and repository.can_create_pr:
                     # Include build title in PR if available
-                    pr_title = f"BOW #{build.build_number}"
+                    pr_title = f"{settings.PROJECT_NAME} #{build.build_number}"
                     if build.title:
                         pr_title += f": {build.title}"
                     
@@ -938,7 +939,7 @@ class GitService:
                         source_branch=branch_name,
                         target_branch=repository.branch or "main",
                         title=pr_title,
-                        description=f"Automated PR from Bag of Words build #{build.build_number}",
+                        description=f"Automated PR from {settings.PROJECT_NAME} build #{build.build_number}",
                     )
                     build.git_pr_url = pr_url
                 
@@ -1421,4 +1422,3 @@ class GitService:
 
 # For backwards compatibility - keep the old class name as an alias
 GitRepositoryService = GitService
-

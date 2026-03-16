@@ -1,0 +1,42 @@
+name: Alfastack Auto Promote On Green Development
+
+on:
+  workflow_run:
+    workflows: ["Alfastack CI"]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: alfastack-auto-promote-development
+  cancel-in-progress: false
+
+jobs:
+  dispatch-promotion:
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'development' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch production promotion workflow for approved release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sSf -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/alfastack-promote-deploy.yml/dispatches" \
+            -d @- <<EOF
+          {
+            "ref": "development",
+            "inputs": {
+              "source_ref": "${{ github.event.workflow_run.head_sha }}",
+              "force_sync_production": "false",
+              "run_docker_build_validation": "true"
+            }
+          }
+          EOF
