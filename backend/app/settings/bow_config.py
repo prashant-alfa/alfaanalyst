@@ -20,9 +20,13 @@ class LLMProvider(BaseModel):
 
 class Intercom(BaseModel):
     enabled: bool = False
+    app_id: Optional[str] = None
 
 class Telemetry(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
+    provider: str = "posthog"
+    host: str = "https://us.i.posthog.com"
+    posthog_api_key: Optional[str] = None
 
 
 class DeploymentConfig(BaseModel):
@@ -70,8 +74,8 @@ class SMTPSettings(BaseModel):
     port: int = 587
     username: str = "resend"
     password: str
-    from_name: str = "Bag of words"
-    from_email: str = "hi@bagofwords.com"
+    from_name: str = "Alfa Analyst"
+    from_email: str = "noreply@analyst.alfastack.cloud"
     use_tls: bool = True
     use_ssl: bool = False
     use_credentials: bool = True
@@ -99,52 +103,13 @@ class LicenseConfig(BaseModel):
         return v
 
 
-class DatabaseAuth(BaseModel):
-    """Authentication method for the application database.
-
-    provider: 'password' (default) uses the password in the URL.
-              'aws_iam' generates short-lived IAM tokens via boto3.
-              Future: 'azure_entra', 'gcp_iam'.
-    """
-    provider: str = "password"
-    region: str = ""       # AWS only — e.g. "us-east-1"
-    ssl_mode: str = ""     # e.g. "verify-full" (required for IAM auth)
-    password: str = ""     # Only used by StaticPasswordProvider when URL has no password
-
-
 class Database(BaseModel):
     url: str = Field(
         default_factory=lambda: os.getenv(
-            "BOW_DATABASE_URL",
+            "BOW_DATABASE_URL", 
             "sqlite:////app/backend/db/app.db"
         )
     )
-    # Fields for managed DB with IAM auth (used when auth.provider != 'password')
-    host: str = Field(default_factory=lambda: os.getenv("BOW_DATABASE_HOST", ""))
-    port: int = Field(default_factory=lambda: int(os.getenv("BOW_DATABASE_PORT", "5432")))
-    name: str = Field(default_factory=lambda: os.getenv("BOW_DATABASE_NAME", ""))
-    username: str = Field(default_factory=lambda: os.getenv("BOW_DATABASE_USER", ""))
-    auth: DatabaseAuth = Field(default_factory=lambda: DatabaseAuth(
-        provider=os.getenv("BOW_DATABASE_AUTH_PROVIDER", "password"),
-        region=os.getenv("BOW_DATABASE_AUTH_REGION", ""),
-        ssl_mode=os.getenv("BOW_DATABASE_SSL_MODE", ""),
-    ))
-
-    def get_url(self) -> str:
-        """Build the connection URL.
-
-        For 'password' provider, returns the existing url field as-is.
-        For IAM providers, constructs the URL from host/port/name/username
-        (password is injected at connect time by the auth provider).
-        """
-        if self.auth.provider == "password":
-            return self.url
-        # IAM auth — build URL without password; it's injected per-connection
-        return f"postgresql://{self.username}@{self.host}:{self.port}/{self.name}"
-
-    @property
-    def uses_iam_auth(self) -> bool:
-        return self.auth.provider != "password"
 
 def generate_fernet_key():
     # Generate a valid Fernet-compatible key (32 url-safe base64-encoded bytes)
