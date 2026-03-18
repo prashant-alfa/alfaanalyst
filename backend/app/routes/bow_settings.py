@@ -10,6 +10,9 @@ router = APIRouter()
 async def get_frontend_settings():
     """Get frontend configuration settings"""
     is_testing = os.getenv("TESTING", "").lower() == "true"
+    telemetry_enabled = settings.bow_config.telemetry.enabled and not is_testing
+    intercom_enabled = settings.bow_config.intercom.enabled and not is_testing
+    brand = settings.brand_config.dict() if settings.brand_config else {}
     
     return JSONResponse({
         "google_oauth": {
@@ -34,11 +37,15 @@ async def get_frontend_settings():
         },
         "base_url": settings.bow_config.base_url,
         "intercom": {
-            "enabled": settings.bow_config.intercom.enabled and not is_testing,
+            "enabled": intercom_enabled,
+            "app_id": settings.bow_config.intercom.app_id if intercom_enabled else None,
         },
         "telemetry": {
-            "enabled": settings.bow_config.telemetry.enabled and not is_testing,
+            "enabled": telemetry_enabled,
+            "provider": settings.bow_config.telemetry.provider,
+            "host": settings.bow_config.telemetry.host,
         },
+        "brand": brand,
         "smtp_enabled": settings.bow_config.smtp_settings is not None,
         "version": settings.PROJECT_VERSION,
         "environment": settings.ENVIRONMENT,
