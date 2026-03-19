@@ -2,21 +2,25 @@ import asyncio
 import base64
 import json
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Dict, Any, Type, List, Optional
 
-import aiofiles
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.ai.tools.base import Tool
-from app.models.file import File
-from app.models.report_file_association import report_file_association
 
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class ValidationResult:
+    """Result of validating artifact code via headless browser."""
+    success: bool
+    errors: List[str] = field(default_factory=list)
+    screenshot_base64: Optional[str] = None
 from app.ai.tools.metadata import ToolMetadata
 from app.ai.tools.schemas import (
     ToolEvent,
@@ -31,8 +35,6 @@ from app.models.artifact import Artifact
 from app.models.visualization import Visualization
 from app.dependencies import async_session_maker
 from app.services.thumbnail_service import ThumbnailService
-from app.services.artifact_libs import get_inline_scripts
-from app.ai.code_execution.pptx_executor import PptxCodeExecutor, PptxPreviewService
 from sqlalchemy import desc
 
 
@@ -51,12 +53,11 @@ class CreateArtifactTool(Tool):
         return ToolMetadata(
             name="create_artifact",
             description=(
-                "Create artifacts (dashboards, pages, slide presentations) from visualizations in the current report. "
+                "Create or update artifacts (dashboards, pages, slide presentations) from visualizations. "
+                "Requires visualization_ids from create_data results in the conversation. "
                 "Modes: 'page' for interactive dashboards with KPI cards, charts, and responsive grids; "
                 "'slides' for presentation decks (exportable to PPTX). "
-                "IMPORTANT: visualization_ids are required - find them in previous create_data tool results "
-                "shown as 'viz_id: <uuid>' in the conversation history. "
-                "Do NOT ask the user for URLs or IDs - extract them from the conversation context. "
+                "To update an existing artifact, provide existing_artifact_id - the previous layout and code will be used as a base. "
                 "Only visualizations with successful step status are included."
             ),
             category="action",
@@ -80,45 +81,70 @@ class CreateArtifactTool(Tool):
     def output_model(self) -> Type[BaseModel]:
         return CreateArtifactOutput
 
-    # Path to the sandbox HTML file (relative to project root)
+    # Sandbox HTML candidates (relative to project root and container runtime paths).
     # __file__ -> implementations -> tools -> ai -> app -> backend -> project_root
-    SANDBOX_HTML_PATH = Path(__file__).parent.parent.parent.parent.parent.parent / "frontend" / "public" / "artifact-sandbox.html"
+    _PROJECT_ROOT = Path(__file__).parent.parent.parent.parent.parent.parent
+    SANDBOX_HTML_PATHS = [
+        _PROJECT_ROOT / "frontend-custom" / "public" / "artifact-sandbox.html",
+        _PROJECT_ROOT / "frontend" / "public" / "artifact-sandbox.html",
+        Path("/app/frontend-custom/public/artifact-sandbox.html"),
+        Path("/app/frontend/public/artifact-sandbox.html"),
+    ]
 
-    async def _take_preview_screenshot(
-        self,
-        html_content: str,
-    ) -> Optional[str]:
-        """Take a quick screenshot for planner reflection. Non-blocking, best-effort.
+    # Validation-specific script to inject (replaces message-based data loading)
+    VALIDATION_SCRIPT = """
+    <script>
+      // ===========================================
+      // Validation Mode Overrides
+      // ===========================================
+      (function() {
+        // Inject artifact data directly (no message passing needed in validation)
+        window.ARTIFACT_DATA = __ARTIFACT_DATA_JSON__;
 
-        Returns base64-encoded PNG string, or None on failure.
-        """
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            return None
+        // Track errors for validation
+        window.__ARTIFACT_ERRORS__ = [];
 
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page(viewport={"width": 1280, "height": 720})
-                await page.set_content(html_content, wait_until="networkidle")
+        // Augment existing error handler to track errors
+        var originalOnError = window.onerror;
+        window.onerror = function(msg, url, lineNo, columnNo, error) {
+          window.__ARTIFACT_ERRORS__.push({
+            type: 'error',
+            message: msg,
+            line: lineNo,
+            column: columnNo,
+            stack: error ? error.stack : null
+          });
+          if (originalOnError) {
+            return originalOnError(msg, url, lineNo, columnNo, error);
+          }
+          return false;
+        };
 
-                # Wait for React to mount and charts to render (short timeout)
-                try:
-                    await page.wait_for_function(
-                        "window.__ARTIFACT_RENDER_COMPLETE__ === true",
-                        timeout=8000,
-                    )
-                except Exception:
-                    pass  # Take screenshot anyway — partial render is still useful
+        window.addEventListener('unhandledrejection', function(event) {
+          window.__ARTIFACT_ERRORS__.push({
+            type: 'unhandledrejection',
+            message: event.reason ? event.reason.message || String(event.reason) : 'Unknown rejection'
+          });
+        });
 
-                await asyncio.sleep(0.3)
-                screenshot_bytes = await page.screenshot(type="png", full_page=False)
-                await browser.close()
-                return base64.b64encode(screenshot_bytes).decode("utf-8")
-        except Exception as e:
-            logger.warning(f"Preview screenshot failed: {e}")
-            return None
+        // Signal when render is complete
+        window.__ARTIFACT_RENDER_COMPLETE__ = false;
+
+        // Hide global loader immediately since we have data
+        var loader = document.getElementById('global-loader');
+        if (loader) loader.classList.add('hidden');
+      })();
+    </script>
+    """
+
+    def _read_sandbox_html(self) -> str:
+        for candidate in self.SANDBOX_HTML_PATHS:
+            if candidate.exists():
+                return candidate.read_text(encoding="utf-8")
+
+        searched = "\n".join(f"- {p}" for p in self.SANDBOX_HTML_PATHS)
+        logger.error("Sandbox HTML not found. Tried:\n%s", searched)
+        raise FileNotFoundError(f"artifact-sandbox.html not found. Tried:\n{searched}")
 
     async def _generate_thumbnail_background(
         self,
@@ -148,55 +174,8 @@ class CreateArtifactTool(Tool):
         except Exception as e:
             logger.warning(f"Failed to generate thumbnail for artifact {artifact_id}: {e}")
 
-    async def _load_completion_images(
-        self,
-        db: Any,
-        head_completion_id: Optional[str],
-    ) -> List[ImageInput]:
-        """Load images attached to the head completion as ImageInput objects.
-
-        Args:
-            db: Database session
-            head_completion_id: The completion ID to load images for
-
-        Returns:
-            List of ImageInput objects ready for vision-capable LLM
-        """
-        if not head_completion_id:
-            return []
-
-        images: List[ImageInput] = []
-        try:
-            # Query files associated with this completion that are images
-            result = await db.execute(
-                select(File)
-                .join(report_file_association, report_file_association.c.file_id == File.id)
-                .where(report_file_association.c.completion_id == head_completion_id)
-                .where(File.content_type.startswith("image/"))
-            )
-            image_files = result.scalars().all()
-
-            for f in image_files:
-                if not f.path:
-                    continue
-                try:
-                    async with aiofiles.open(f.path, 'rb') as file:
-                        content = await file.read()
-                    images.append(ImageInput(
-                        data=base64.b64encode(content).decode('utf-8'),
-                        media_type=f.content_type or 'image/png',
-                        source_type='base64'
-                    ))
-                except Exception as e:
-                    logger.warning(f"Failed to load image file {f.id}: {e}")
-
-        except Exception as e:
-            logger.warning(f"Failed to query completion images: {e}")
-
-        return images
-
-    def _build_thumbnail_html(self, artifact_data: dict, code: str, mode: str = "page") -> str:
-        """Build HTML for thumbnail generation in headless browser.
+    def _build_validation_html(self, artifact_data: dict, code: str, mode: str = "page") -> str:
+        """Build HTML for validation by reading sandbox file and injecting validation code.
 
         Args:
             artifact_data: The data to inject as window.ARTIFACT_DATA
@@ -209,14 +188,14 @@ class CreateArtifactTool(Tool):
         data_json = json.dumps(artifact_data, default=str)
 
         # Slides mode: pure HTML + Tailwind (no React/Babel)
+        # Use string replacement instead of f-string to avoid JSON escaping issues
         if mode == "slides":
-            slides_scripts = get_inline_scripts(mode="slides")
             slides_template = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  __SLIDES_SCRIPTS__
+  <script src="https://cdn.tailwindcss.com"></script>
   <style>
     html, body { height: 100%; margin: 0; padding: 0; }
     body { font-family: system-ui, -apple-system, sans-serif; }
@@ -226,6 +205,23 @@ class CreateArtifactTool(Tool):
 <body class="bg-slate-900">
   <script>
     window.ARTIFACT_DATA = __ARTIFACT_DATA_JSON__;
+    window.__ARTIFACT_ERRORS__ = [];
+    window.onerror = function(msg, url, lineNo, columnNo, error) {
+      window.__ARTIFACT_ERRORS__.push({
+        type: 'error',
+        message: msg,
+        line: lineNo,
+        column: columnNo,
+        stack: error ? error.stack : null
+      });
+      return false;
+    };
+    window.addEventListener('unhandledrejection', function(event) {
+      window.__ARTIFACT_ERRORS__.push({
+        type: 'unhandledrejection',
+        message: event.reason ? event.reason.message || String(event.reason) : 'Unknown rejection'
+      });
+    });
     window.__ARTIFACT_RENDER_COMPLETE__ = false;
     setTimeout(function() {
       window.__ARTIFACT_RENDER_COMPLETE__ = true;
@@ -235,81 +231,135 @@ class CreateArtifactTool(Tool):
   __LLM_GENERATED_CODE__
 </body>
 </html>"""
-            return slides_template.replace("__SLIDES_SCRIPTS__", slides_scripts).replace("__ARTIFACT_DATA_JSON__", data_json).replace("__LLM_GENERATED_CODE__", code)
+            return slides_template.replace("__ARTIFACT_DATA_JSON__", data_json).replace("__LLM_GENERATED_CODE__", code)
 
         # Page mode: Read the sandbox HTML file for React/Babel
-        try:
-            sandbox_html = self.SANDBOX_HTML_PATH.read_text()
-        except FileNotFoundError:
-            logger.error(f"Sandbox HTML not found at {self.SANDBOX_HTML_PATH}")
-            raise
+        sandbox_html = self._read_sandbox_html()
 
-        # Replace local /libs/... script tags with inline scripts for headless browser
-        # (page.set_content renders at about:blank where relative paths don't resolve)
-        import re
-        page_scripts = get_inline_scripts(mode="page")
-        sandbox_html = re.sub(
-            r'<script[^>]*src="/libs/[^"]*"[^>]*></script>\s*',
-            '',
-            sandbox_html,
-        )
-        sandbox_html = sandbox_html.replace('</head>', f'{page_scripts}\n</head>')
+        # Prepare the validation script with data injected
+        validation_script = self.VALIDATION_SCRIPT.replace("__ARTIFACT_DATA_JSON__", data_json)
 
-        # Inject data directly for headless rendering
-        data_script = f"""
-    <script>
-      window.ARTIFACT_DATA = {data_json};
-      window.__ARTIFACT_RENDER_COMPLETE__ = false;
-      var loader = document.getElementById('global-loader');
-      if (loader) loader.classList.add('hidden');
-    </script>
-    """
-        html = sandbox_html.replace("<body>", f"<body>\n{data_script}")
+        # Insert validation script after <body> tag
+        html = sandbox_html.replace("<body>", f"<body>\n{validation_script}")
 
         # Replace the LLM_GENERATED_CODE placeholder with actual code
         html = html.replace("<!-- LLM_GENERATED_CODE -->", code)
 
-        # Smart render detection: polls DOM until React mounts and spinners disappear
+        # Add render complete signal at the end
         render_complete_script = """
     <script>
-      (function detectRenderComplete() {
-        var startTime = Date.now();
-        var MAX_WAIT = 15000;
-
-        function check() {
-          if (Date.now() - startTime > MAX_WAIT) {
-            window.__ARTIFACT_RENDER_COMPLETE__ = true;
-            return;
-          }
-
-          var root = document.getElementById('root');
-          if (!root || root.children.length === 0) {
-            setTimeout(check, 200);
-            return;
-          }
-
-          var spinners = root.querySelectorAll('svg animateTransform');
-          for (var i = 0; i < spinners.length; i++) {
-            var svg = spinners[i].closest('svg');
-            if (svg && svg.offsetWidth > 0 && svg.offsetHeight > 0) {
-              setTimeout(check, 200);
-              return;
-            }
-          }
-
-          var hasCharts = root.querySelectorAll('canvas').length > 0;
-          setTimeout(function() {
-            window.__ARTIFACT_RENDER_COMPLETE__ = true;
-          }, hasCharts ? 1500 : 300);
-        }
-
-        setTimeout(check, 200);
-      })();
+      // Mark render complete after a short delay to allow React to mount
+      setTimeout(function() {
+        window.__ARTIFACT_RENDER_COMPLETE__ = true;
+      }, 100);
     </script>
     """
         html = html.replace("</body>", f"{render_complete_script}</body>")
 
         return html
+
+    async def _validate_artifact(
+        self,
+        code: str,
+        mode: str,
+        visualizations: List[Dict[str, Any]],
+        report: Any,
+        allow_llm_see_data: bool = True,
+    ) -> ValidationResult:
+        """Validate artifact code by rendering in a headless browser.
+
+        Args:
+            code: The generated artifact code
+            mode: 'page' or 'slides'
+            visualizations: List of visualization data dicts
+            report: The report object (for building ARTIFACT_DATA)
+            allow_llm_see_data: If False, skip screenshot capture for privacy
+
+        Returns:
+            ValidationResult with success status, errors, and optional screenshot
+        """
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("Playwright not installed, skipping artifact validation")
+            return ValidationResult(
+                success=True,
+                errors=["Playwright not installed - validation skipped"]
+            )
+
+        # Build the artifact data structure
+        artifact_data = {
+            "report": {
+                "id": str(report.id) if report else None,
+                "title": getattr(report, 'title', None) if report else None,
+                "theme": getattr(report, 'theme', None) if report else None,
+            },
+            "visualizations": visualizations,
+        }
+
+        # Build the HTML to render using the sandbox file (mode-aware)
+        html = self._build_validation_html(artifact_data, code, mode=mode)
+
+        errors: List[str] = []
+        screenshot_base64: Optional[str] = None
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page(viewport={"width": 1280, "height": 720})
+
+                # Capture console errors
+                def handle_console(msg):
+                    if msg.type == "error":
+                        errors.append(f"Console error: {msg.text}")
+
+                page.on("console", handle_console)
+
+                # Capture page errors
+                def handle_page_error(error):
+                    errors.append(f"Page error: {str(error)}")
+
+                page.on("pageerror", handle_page_error)
+
+                # Load the HTML content directly (no network request needed)
+                await page.set_content(html, wait_until="networkidle")
+
+                # Wait for render to complete (with timeout)
+                try:
+                    await page.wait_for_function(
+                        "window.__ARTIFACT_RENDER_COMPLETE__ === true",
+                        timeout=10000
+                    )
+                except Exception as e:
+                    errors.append(f"Render timeout: {str(e)}")
+
+                # Give React/ECharts a bit more time to fully render
+                await asyncio.sleep(1.0)
+
+                # Collect any errors captured by our error handlers
+                captured_errors = await page.evaluate("window.__ARTIFACT_ERRORS__")
+                for err in captured_errors:
+                    err_msg = err.get("message", "Unknown error")
+                    if err.get("line"):
+                        err_msg += f" (line {err.get('line')})"
+                    errors.append(err_msg)
+
+                # Take screenshot only if allow_llm_see_data is True (privacy setting)
+                if allow_llm_see_data:
+                    screenshot_bytes = await page.screenshot(type="png", full_page=False)
+                    screenshot_base64 = base64.b64encode(screenshot_bytes).decode("utf-8")
+
+                await browser.close()
+
+        except Exception as e:
+            logger.exception("Error during artifact validation")
+            errors.append(f"Validation error: {str(e)}")
+
+        return ValidationResult(
+            success=len(errors) == 0,
+            errors=errors,
+            screenshot_base64=screenshot_base64,
+        )
 
     async def _fix_code(
         self,
@@ -319,7 +369,6 @@ class CreateArtifactTool(Tool):
         runtime_ctx: Dict[str, Any],
         prompt_context: Dict[str, Any],
         screenshot_base64: Optional[str] = None,
-        completion_images: Optional[List[ImageInput]] = None,
     ) -> str:
         """Attempt to fix code errors using the same prompt with error context.
 
@@ -330,9 +379,8 @@ class CreateArtifactTool(Tool):
             runtime_ctx: Runtime context for LLM access
             prompt_context: Context needed to rebuild the original prompt
                 (user_prompt, title, viz_profiles, instructions_context,
-                 report_title, allow_llm_see_data, messages_context, image_count)
+                 report_title, allow_llm_see_data, messages_context, previous_artifacts)
             screenshot_base64: Optional screenshot of the broken render for visual context
-            completion_images: Optional list of images from the head completion
 
         Returns:
             Fixed code string
@@ -349,7 +397,7 @@ class CreateArtifactTool(Tool):
             report_title=prompt_context["report_title"],
             allow_llm_see_data=prompt_context["allow_llm_see_data"],
             messages_context=prompt_context.get("messages_context", ""),
-            image_count=prompt_context.get("image_count", 0),
+            previous_artifacts=prompt_context.get("previous_artifacts"),
         )
 
         # Build screenshot context if available
@@ -378,21 +426,16 @@ Fix these errors while keeping the same design and functionality. Output the cor
         # Use the same model for fixes
         llm = LLM(runtime_ctx.get("model"), usage_session_maker=async_session_maker)
 
-        # Build image inputs: completion images + screenshot (if available)
-        images: List[ImageInput] = []
+        # Build image input if screenshot is available and model supports vision
+        images: Optional[List[ImageInput]] = None
         model = runtime_ctx.get("model")
-        if model and getattr(model, "supports_vision", False):
-            # Add completion images first (user's reference images)
-            if completion_images:
-                images.extend(completion_images)
-            # Add screenshot of broken render last
-            if screenshot_base64:
-                images.append(ImageInput(data=screenshot_base64, media_type="image/png", source_type="base64"))
+        if screenshot_base64 and model and getattr(model, "supports_vision", False):
+            images = [ImageInput(data=screenshot_base64, media_type="image/png", source_type="base64")]
 
         try:
-            response = llm.inference(
+            response = await llm.inference(
                 fix_prompt,
-                images=images if images else None,
+                images=images,
                 usage_scope="create_artifact_fix",
                 usage_scope_ref_id=None,
             )
@@ -465,28 +508,6 @@ Fix these errors while keeping the same design and functionality. Output the cor
                     if stats:
                         profile["column_stats"] = stats
 
-                    # Identify filterable columns: categorical with reasonable cardinality
-                    filterable = []
-                    for col in viz.get("columns", []):
-                        col_name = col if isinstance(col, str) else col.get("field", col.get("name"))
-                        if not col_name:
-                            continue
-                        values = [r.get(col_name) for r in rows if r.get(col_name) is not None]
-                        if not values:
-                            continue
-                        # Skip numeric-only columns (metrics, not dimensions)
-                        if all(isinstance(v, (int, float)) for v in values):
-                            continue
-                        unique = list(set(str(v) for v in values))
-                        # Filterable: has repeating values (not all unique) and reasonable cardinality
-                        if 2 <= len(unique) <= 30 and len(unique) < len(values):
-                            filterable.append({
-                                "field": col_name,
-                                "unique_values": sorted(unique),
-                            })
-                    if filterable:
-                        profile["filterable_columns"] = filterable
-
         return profile
 
     async def run_stream(self, tool_input: Dict[str, Any], runtime_ctx: Dict[str, Any]) -> AsyncIterator[ToolEvent]:
@@ -542,133 +563,116 @@ Fix these errors while keeping the same design and functionality. Output the cor
         try:
             _messages_section_obj = getattr(context_view.warm, "messages", None) if context_view else None
             messages_context = _messages_section_obj.render() if _messages_section_obj else ""
-        except Exception as e:
-            logger.warning(f"Failed to extract messages context: {e}")
+        except Exception:
             messages_context = ""
 
-        # Load images attached to the head completion for vision-capable models
-        head_completion = runtime_ctx.get("head_completion")
-        head_completion_id = str(head_completion.id) if head_completion else None
-        completion_images = await self._load_completion_images(db, head_completion_id)
-
-        # Validate model supports vision if images are present
-        model = runtime_ctx.get("model")
-        if completion_images and not getattr(model, "supports_vision", False):
-            logger.info(f"Model doesn't support vision, skipping {len(completion_images)} completion images")
-            completion_images = []
-
-        # Note: Previous artifacts are now available via observation context (from create_artifact/read_artifact)
-        # No need to fetch from DB - the planner can call read_artifact if needed
+        # Fetch previous artifacts for the same report and mode (for iterative refinement)
+        previous_artifacts: List[Dict[str, Any]] = []
+        try:
+            if report:
+                result = await db.execute(
+                    select(Artifact)
+                    .where(Artifact.report_id == str(report.id))
+                    .where(Artifact.mode == data.mode)
+                    .where(Artifact.status == "completed")
+                    .order_by(desc(Artifact.created_at))
+                    .limit(3)
+                )
+                prev_artifacts = result.scalars().all()
+                for art in prev_artifacts:
+                    artifact_info = {
+                        "id": str(art.id),
+                        "title": art.title,
+                        "created_at": str(art.created_at) if art.created_at else None,
+                        "code": (art.content or {}).get("code", "")[:2000],  # Limit code length
+                    }
+                    previous_artifacts.append(artifact_info)
+        except Exception:
+            previous_artifacts = []
 
         # Fetch visualizations by ID from database
         visualizations: List[Dict[str, Any]] = []
         warnings: List[str] = []
         included_viz_ids: List[str] = []
 
-        # Fetch all visualizations in a single batched query
+        # Build a lookup of query data from context_hub for enrichment
+        query_data_lookup: Dict[str, Dict[str, Any]] = {}
+        try:
+            if context_hub is not None:
+                view = context_hub.get_view()
+                qsec = getattr(getattr(view, 'warm', None), 'queries', None)
+                items = getattr(qsec, 'items', []) if qsec else []
+                for it in (items or []):
+                    query_id = getattr(it, 'query_id', None)
+                    if query_id:
+                        query_data_lookup[str(query_id)] = {
+                            "columns": list(getattr(it, 'column_names', []) or []),
+                            "row_count": getattr(it, 'row_count', 0),
+                            "rows": list(getattr(it, 'rows', []) or [])[:100],
+                            "dataModel": getattr(it, 'data_model', None) or {},
+                        }
+        except Exception:
+            pass
+
+        # Fetch and validate visualizations from DB
         from app.models.query import Query
         from app.models.step import Step
         report_id = str(report.id) if report else None
-        try:
-            result = await db.execute(
-                select(Visualization)
-                .options(
-                    selectinload(Visualization.query).selectinload(Query.default_step),
-                    selectinload(Visualization.query).selectinload(Query.steps),
-                )
-                .where(Visualization.id.in_(data.visualization_ids))
-            )
-            fetched_vizs = {str(v.id): v for v in result.scalars().all()}
-        except Exception as e:
-            logger.exception("Failed to batch-fetch visualizations")
-            fetched_vizs = {}
-            warnings.append(f"Error fetching visualizations: {str(e)}")
-
-        # Process each requested viz in order, validating and building entries
         for viz_id in data.visualization_ids:
-            viz = fetched_vizs.get(viz_id)
-            if viz is None:
-                warnings.append(f"Visualization {viz_id} not found")
-                continue
+            try:
+                # Eagerly load query -> default_step and steps to avoid async lazy loading issues
+                result = await db.execute(
+                    select(Visualization)
+                    .options(
+                        selectinload(Visualization.query).selectinload(Query.default_step),
+                        selectinload(Visualization.query).selectinload(Query.steps),
+                    )
+                    .where(Visualization.id == viz_id)
+                )
+                viz = result.scalar_one_or_none()
 
-            # Validate viz belongs to the report
-            if report_id and str(viz.report_id) != report_id:
-                warnings.append(f"Visualization {viz_id} does not belong to this report")
-                continue
+                if viz is None:
+                    warnings.append(f"Visualization {viz_id} not found")
+                    continue
 
-            # Get the step with data (prefer default_step, fallback to latest step)
-            step = None
-            if viz.query and viz.query.default_step:
-                step = viz.query.default_step
-            elif viz.query and viz.query.steps:
-                step = viz.query.steps[-1] if viz.query.steps else None
+                # Validate viz belongs to the report
+                if report_id and str(viz.report_id) != report_id:
+                    warnings.append(f"Visualization {viz_id} does not belong to this report")
+                    continue
 
-            # Check if the associated step is successful
-            step_status = step.status if step else None
-            if step_status != "success":
-                warnings.append(f"Visualization {viz_id} skipped: step status is '{step_status or 'unknown'}' (not success)")
-                continue
+                # Check if the associated step is successful
+                step_status = None
+                if viz.query and viz.query.default_step:
+                    step_status = viz.query.default_step.status
+                elif viz.query and viz.query.steps:
+                    # Fallback to the latest step if no default_step
+                    step_status = viz.query.steps[-1].status if viz.query.steps else None
 
-            # Get data directly from step (like frontend does)
-            step_data = step.data if step else {}
-            rows = (step_data.get("rows") or [])[:100] if step_data else []
-            raw_columns = step_data.get("columns") or [] if step_data else []
-            data_model = step.data_model if step else {}
+                if step_status != "success":
+                    warnings.append(f"Visualization {viz_id} skipped: step status is '{step_status or 'unknown'}' (not success)")
+                    continue
 
-            # Keep raw column objects (with field/headerName) — matches the prompt contract
-            columns = raw_columns
+                # Build visualization entry
+                view_dict = viz.view or {}
+                query_id = str(viz.query_id) if viz.query_id else None
+                query_data = query_data_lookup.get(query_id, {}) if query_id else {}
 
-            # Extract field names for internal use (filterable columns, logging)
-            column_fields = []
-            for c in raw_columns:
-                if isinstance(c, str):
-                    column_fields.append(c)
-                elif isinstance(c, dict):
-                    col_name = c.get("field") or c.get("colId") or c.get("headerName") or c.get("name")
-                    if col_name:
-                        column_fields.append(col_name)
+                ventry = {
+                    "id": str(viz.id),
+                    "title": viz.title,
+                    "query_id": query_id,
+                    "view": self._trim_none(view_dict),
+                    "data_model_type": (view_dict.get("view") or {}).get("type") or view_dict.get("type"),
+                    "columns": query_data.get("columns", []),
+                    "row_count": query_data.get("row_count", 0),
+                    "rows": query_data.get("rows", []),
+                    "dataModel": query_data.get("dataModel", {}),
+                }
+                visualizations.append(ventry)
+                included_viz_ids.append(str(viz.id))
 
-            # Build visualization entry
-            view_dict = viz.view or {}
-            query_id = str(viz.query_id) if viz.query_id else None
-
-            # Compute filterable columns for this visualization
-            filterable_columns = []
-            if rows and isinstance(rows[0], dict):
-                for col_name in column_fields:
-                    values = [r.get(col_name) for r in rows if r.get(col_name) is not None]
-                    if not values:
-                        continue
-                    if all(isinstance(v, (int, float)) for v in values):
-                        continue
-                    unique = sorted(set(str(v) for v in values))
-                    if 2 <= len(unique) <= 30 and len(unique) < len(values):
-                        filterable_columns.append({
-                            "field": col_name,
-                            "unique_values": unique,
-                        })
-
-            ventry = {
-                "id": str(viz.id),
-                "title": viz.title,
-                "query_id": query_id,
-                "view": self._trim_none(view_dict),
-                "data_model_type": (view_dict.get("view") or {}).get("type") or view_dict.get("type"),
-                "columns": columns,
-                "row_count": len(rows),
-                "rows": rows,
-                "dataModel": data_model or {},
-            }
-            if filterable_columns:
-                ventry["filterable_columns"] = filterable_columns
-
-            # Debug logging
-            logger.info(f"Visualization {viz.title}: {len(rows)} rows, {len(column_fields)} columns: {column_fields[:5] if column_fields else 'none'}")
-            if rows:
-                logger.info(f"  Sample row keys: {list(rows[0].keys())[:5] if isinstance(rows[0], dict) else 'not a dict'}")
-
-            visualizations.append(ventry)
-            included_viz_ids.append(str(viz.id))
+            except Exception as e:
+                warnings.append(f"Error fetching visualization {viz_id}: {str(e)}")
 
         # Early failure: if no valid visualizations were resolved, fail like create_data does with tables
         if not visualizations:
@@ -742,7 +746,7 @@ Fix these errors while keeping the same design and functionality. Output the cor
             "report_title": getattr(report, 'title', None) if report else None,
             "allow_llm_see_data": allow_llm_see_data,
             "messages_context": messages_context,
-            "image_count": len(completion_images),
+            "previous_artifacts": previous_artifacts,
         }
 
         prompt = self._build_prompt(
@@ -754,7 +758,7 @@ Fix these errors while keeping the same design and functionality. Output the cor
             report_title=prompt_context["report_title"],
             allow_llm_see_data=allow_llm_see_data,
             messages_context=messages_context,
-            image_count=len(completion_images),
+            previous_artifacts=previous_artifacts,
         )
 
         # Stream from LLM
@@ -764,7 +768,6 @@ Fix these errors while keeping the same design and functionality. Output the cor
 
         async for chunk in llm.inference_stream(
             prompt,
-            images=completion_images if completion_images else None,
             usage_scope="create_artifact",
             usage_scope_ref_id=str(report.id) if report else None,
         ):
@@ -798,118 +801,83 @@ Fix these errors while keeping the same design and functionality. Output the cor
         code = self._extract_code(buffer, mode=data.mode)
 
         # ═══════════════════════════════════════════════════════════════════════
-        # Mode-specific processing: slides uses python-pptx, page skips to save
+        # Validation loop: render in headless browser and fix errors if needed
         # ═══════════════════════════════════════════════════════════════════════
+        max_validation_attempts = 3
+        validation_result: Optional[ValidationResult] = None
 
-        pptx_path: Optional[str] = None
-        pptx_success: bool = True
-        preview_images: List[str] = []
-
-        if data.mode == "slides":
-            # ═══════════════════════════════════════════════════════════════════
-            # SLIDES MODE: Execute python-pptx code and generate previews
-            # ═══════════════════════════════════════════════════════════════════
+        for attempt in range(max_validation_attempts):
             yield ToolProgressEvent(
                 type="tool.progress",
-                payload={"stage": "executing_pptx_code"}
+                payload={
+                    "stage": "validating",
+                    "attempt": attempt + 1,
+                    "max_attempts": max_validation_attempts,
+                }
             )
 
-            try:
-                # Prepare data for execution
-                report_data = {
-                    "id": str(report.id) if report else None,
-                    "title": getattr(report, "title", None) if report else None,
-                    "theme": getattr(report, "theme", None) if report else None,
-                }
+            validation_result = await self._validate_artifact(
+                code=code,
+                mode=data.mode,
+                visualizations=visualizations,
+                report=report,
+                allow_llm_see_data=allow_llm_see_data,
+            )
 
-                # Setup output path
-                uploads_dir = Path(__file__).parent.parent.parent.parent.parent / "uploads" / "pptx"
-                uploads_dir.mkdir(parents=True, exist_ok=True)
-                output_path = uploads_dir / f"{artifact.id}.pptx"
+            if validation_result.success:
+                # Validation passed
+                break
 
-                # Execute the python-pptx code
-                executor = PptxCodeExecutor(logger=logger)
-                result_path, output_log = executor.execute_pptx_code(
-                    code=code,
-                    visualizations=visualizations,
-                    report=report_data,
-                    output_path=output_path,
-                )
-
-                pptx_path = str(result_path)
-
+            if attempt < max_validation_attempts - 1:
+                # Try to fix the code
                 yield ToolProgressEvent(
                     type="tool.progress",
-                    payload={"stage": "generating_previews"}
+                    payload={
+                        "stage": "fixing_errors",
+                        "attempt": attempt + 1,
+                        "errors": validation_result.errors[:3],  # Show first 3 errors
+                    }
                 )
-
-                # Generate preview images
-                preview_service = PptxPreviewService(logger=logger)
-                preview_images = preview_service.generate_previews(
-                    pptx_path=result_path,
-                    artifact_id=str(artifact.id),
+                code = await self._fix_code(
+                    code=code,
+                    errors=validation_result.errors,
+                    mode=data.mode,
+                    runtime_ctx=runtime_ctx,
+                    prompt_context=prompt_context,
+                    screenshot_base64=validation_result.screenshot_base64,
                 )
-
-            except Exception as e:
-                logger.error(f"PPTX execution failed: {e}")
-                pptx_success = False
 
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "saving_artifact"})
 
-        # Build content object
+        # Build content object (slides structure is parsed from HTML at export time)
         content: Dict[str, Any] = {
             "code": code,
             "visualization_ids": included_viz_ids,
         }
 
-        # Add slides-specific content
-        if data.mode == "slides" and preview_images:
-            content["preview_images"] = preview_images
-
         # Update the pending artifact with content and mark as completed
         artifact.content = content
-        artifact.status = "completed" if (data.mode != "slides" or pptx_success) else "failed"
-
-        # Set pptx_path for slides mode
-        if pptx_path:
-            artifact.pptx_path = pptx_path
-
+        artifact.status = "completed" if (validation_result and validation_result.success) else "completed"
         await db.commit()
         await db.refresh(artifact)
 
-        # Page mode: take preview screenshot for planner reflection + generate thumbnail
-        screenshot_base64: Optional[str] = None
-        if data.mode == "page":
-            artifact_data = {
-                "report": {
-                    "id": str(report.id) if report else None,
-                    "title": getattr(report, "title", None) if report else None,
-                    "theme": getattr(report, "theme", None) if report else None,
-                },
-                "visualizations": visualizations,
-            }
-            thumbnail_html = self._build_thumbnail_html(artifact_data, code, mode=data.mode)
-
-            # Take preview screenshot (synchronous, ~3-5s) if model supports vision
-            model = runtime_ctx.get("model")
-            if allow_llm_see_data and model and getattr(model, "supports_vision", False):
-                yield ToolProgressEvent(type="tool.progress", payload={"stage": "capturing_preview"})
-                screenshot_base64 = await self._take_preview_screenshot(thumbnail_html)
-
-            # Generate thumbnail in background (for stored thumbnail, non-blocking)
-            asyncio.create_task(
-                self._generate_thumbnail_background(
-                    artifact_id=str(artifact.id),
-                    html_content=thumbnail_html,
-                    mode=data.mode,
-                )
+        # Generate thumbnail in background (truly non-blocking)
+        artifact_data = {
+            "report": {
+                "id": str(report.id) if report else None,
+                "title": getattr(report, "title", None) if report else None,
+                "theme": getattr(report, "theme", None) if report else None,
+            },
+            "visualizations": visualizations,
+        }
+        thumbnail_html = self._build_validation_html(artifact_data, code, mode=data.mode)
+        asyncio.create_task(
+            self._generate_thumbnail_background(
+                artifact_id=str(artifact.id),
+                html_content=thumbnail_html,
+                mode=data.mode,
             )
-        elif preview_images:
-            # For slides mode, use the first preview image as thumbnail
-            first_preview = Path(__file__).parent.parent.parent.parent.parent / "uploads" / preview_images[0]
-            if first_preview.exists():
-                artifact.thumbnail_path = preview_images[0]
-                await db.commit()
+        )
 
         output = CreateArtifactOutput(
             artifact_id=str(artifact.id),
@@ -917,35 +885,13 @@ Fix these errors while keeping the same design and functionality. Output the cor
             mode=data.mode,
             title=data.title,
             version=artifact.version,
-        ).model_dump()
+        )
 
-        # Add UI preview fields (similar to read_artifact)
-        code_lines = code.count('\n') + 1 if code else 0
-        output["artifact_preview"] = {
-            "artifact_id": str(artifact.id),
-            "title": data.title or "Untitled",
-            "mode": data.mode,
-            "version": artifact.version,
-            "code_stats": {
-                "chars": len(code),
-                "lines": code_lines,
-            },
-            "visualization_ids": included_viz_ids,
-            "visualization_count": len(visualizations),
-        }
-        # Code for collapsible toggle (collapsed by default in UI)
-        output["code_preview"] = {
-            "language": "jsx",
-            "code": code,
-            "collapsed_default": True,
-        }
-
-        # Build observation message
+        # Build observation message - include screenshot context if available
+        has_screenshot = validation_result and validation_result.screenshot_base64
         summary_msg = f"Created artifact '{data.title or 'Untitled'}' with {len(code)} characters of code"
-        if data.mode == "slides" and preview_images:
-            summary_msg += f". Generated {len(preview_images)} slide preview images."
-        elif screenshot_base64:
-            summary_msg += ". Screenshot of the rendered dashboard is attached — review it for visual correctness."
+        if has_screenshot:
+            summary_msg += ". Screenshot of the rendered dashboard is attached for validation."
 
         observation: Dict[str, Any] = {
             "summary": summary_msg,
@@ -953,24 +899,21 @@ Fix these errors while keeping the same design and functionality. Output the cor
             "mode": data.mode,
             "visualization_count": len(visualizations),
             "visualization_ids": included_viz_ids,
-            "code": code,  # Include code for iteration context (compacted by observation builder after next artifact)
         }
 
-        # Add preview screenshot for planner reflection (page mode)
-        if screenshot_base64:
-            observation["images"] = [{
-                "data": screenshot_base64,
-                "media_type": "image/png",
-                "source_type": "base64",
-            }]
-
-        # Add slides-specific info
-        if data.mode == "slides":
-            if preview_images:
-                observation["preview_images"] = preview_images
-                observation["slide_count"] = len(preview_images)
-            if pptx_path:
-                observation["pptx_path"] = pptx_path
+        # Add validation info to observation
+        if validation_result:
+            observation["validation"] = {
+                "success": validation_result.success,
+                "errors": validation_result.errors if not validation_result.success else [],
+            }
+            # Add screenshot as images array for vision model consumption
+            if validation_result.screenshot_base64:
+                observation["images"] = [{
+                    "data": validation_result.screenshot_base64,
+                    "media_type": "image/png",
+                    "source_type": "base64",
+                }]
 
         if warnings:
             observation["warnings"] = warnings
@@ -978,7 +921,7 @@ Fix these errors while keeping the same design and functionality. Output the cor
         yield ToolEndEvent(
             type="tool.end",
             payload={
-                "output": output,
+                "output": output.model_dump(),
                 "observation": observation,
             }
         )
@@ -1012,39 +955,72 @@ Fix these errors while keeping the same design and functionality. Output the cor
         report_title: str | None,
         allow_llm_see_data: bool,
         messages_context: str = "",
-        image_count: int = 0,
+        previous_artifacts: List[Dict[str, Any]] | None = None,
     ) -> str:
-        """Build the prompt for generating slides using python-pptx code."""
+        """Build the prompt for generating slides (pure HTML + vanilla JS)."""
         viz_json = json.dumps(viz_profiles, indent=2, default=str)
 
-        # Build attached images context
-        images_context = ""
-        if image_count > 0:
-            images_context = f"\n**Attached Images:** {image_count} image(s) provided for visual reference. Use these to understand the design intent, branding, color schemes, or layout preferences the user wants to incorporate."
+        # Build previous artifacts context
+        previous_artifacts_context = ""
+        if previous_artifacts:
+            previous_artifacts_context = "\n═══════════════════════════════════════════════════════════════════════════════\nPREVIOUS ARTIFACTS (for reference/iteration)\n═══════════════════════════════════════════════════════════════════════════════\n\n"
+            for i, art in enumerate(previous_artifacts):
+                previous_artifacts_context += f"**Artifact {i+1}: {art.get('title', 'Untitled')}** (ID: {art.get('id')})\n"
+                if art.get('code'):
+                    previous_artifacts_context += f"```html\n{art.get('code')}\n```\n\n"
 
-        return f"""You are an expert at creating professional presentations using python-pptx.
-Generate python-pptx code to create a polished slide deck.
+        return f"""You are a world-class frontend developer and data visualization expert. Create a STUNNING, publication-quality slide presentation.
 
 ═══════════════════════════════════════════════════════════════════════════════
-AVAILABLE IN NAMESPACE (do not import - already provided)
+AVAILABLE (pre-loaded globally)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Python-pptx classes and FUNCTIONS:
-- Presentation, Inches, Pt, Emu, RGBColor
-- PP_ALIGN, MSO_ANCHOR, MSO_SHAPE
-- XL_CHART_TYPE, XL_LEGEND_POSITION
-- CategoryChartData, ChartData
+• **Tailwind CSS** - All utility classes available
+  - Use modern design: rounded-xl, shadow-lg, backdrop-blur, gradients
+  - Dark themes: bg-slate-900, text-white, text-slate-400
+  - Flexbox, grid, spacing utilities
 
-⚠️ CRITICAL: Inches, Pt, Emu are FUNCTIONS, not methods!
-   ✅ CORRECT: Inches(1), Pt(24), Emu(914400)
-   ❌ WRONG: 1.inches, 24.pt, value.inches
+• **Vanilla JavaScript** - No frameworks needed
+  - DOM manipulation: querySelector, classList, addEventListener
+  - Access data via window.ARTIFACT_DATA
 
-Data variables:
-- visualizations: List[Dict] - each has 'title', 'columns', 'rows'
-- report: Dict with 'id', 'title', 'theme'
+**DO NOT USE:** React, Babel, JSX, or any framework. Pure HTML + JS only.
 
-Output:
-- _pptx_output_path: str - path where you MUST save the presentation
+═══════════════════════════════════════════════════════════════════════════════
+DATA ACCESS
+═══════════════════════════════════════════════════════════════════════════════
+
+Data is available via `window.ARTIFACT_DATA`:
+```javascript
+const data = window.ARTIFACT_DATA;
+const report = data.report;  // {{id, title, theme}}
+const visualizations = data.visualizations;  // Array of viz objects
+```
+
+**Note:** A global loading spinner is shown until data arrives. You do NOT need to implement loading state.
+
+Each visualization object has this EXACT structure:
+```js
+{{
+  id: "uuid-string",
+  title: "Visualization Title",
+  columns: [
+    {{ "headerName": "AlbumId", "field": "AlbumId" }},
+    {{ "headerName": "Album Title", "field": "AlbumTitle" }},
+    {{ "headerName": "Total Revenue", "field": "total_revenue" }}
+  ],
+  rows: [
+    {{ "AlbumId": 253, "AlbumTitle": "Battlestar Galactica", "total_revenue": 35.82 }},
+    {{ "AlbumId": 251, "AlbumTitle": "The Office", "total_revenue": 31.84 }},
+    // ... more rows
+  ]
+}}
+```
+
+**CRITICAL - How to access data:**
+- Use `column.field` to get the key for accessing row data: `row[column.field]`
+- Use `column.headerName` for display labels in table headers
+- Example: `rows.map(row => row[columns[0].field])` to get values for first column
 
 ═══════════════════════════════════════════════════════════════════════════════
 YOUR VISUALIZATIONS
@@ -1052,293 +1028,218 @@ YOUR VISUALIZATIONS
 
 {viz_json}
 
-{"(Full sample data included above)" if allow_llm_see_data else "(Data samples hidden for privacy - use column names and row_count)"}
+{"(Full sample data included above)" if allow_llm_see_data else "(Data samples hidden for privacy - use column names and row_count to understand the data structure)"}
 
 ═══════════════════════════════════════════════════════════════════════════════
-TASK
+SLIDES MODE - PURE HTML PRESENTATION (NO REACT)
 ═══════════════════════════════════════════════════════════════════════════════
 
-**Report Title:** {report_title or title or 'Presentation'}
+You are creating a **slide presentation** using PURE HTML + Tailwind CSS.
+**DO NOT use React, Babel, or JSX.** Use vanilla JavaScript only.
+
+**CRITICAL: Use these EXACT CSS classes for PPTX export compatibility:**
+
+**Slide Container:**
+```html
+<section class="slide" data-slide="0" data-type="title">
+  <!-- data-type: "title", "metrics", "bullets", "chart", "text" -->
+</section>
+```
+
+**Title Slide (data-type="title"):**
+```html
+<h1 class="pptx-title">Main Title Here</h1>
+<p class="pptx-subtitle">Subtitle or date here</p>
+```
+
+**Slide Heading (all other slides):**
+```html
+<h2 class="pptx-heading">Slide Heading</h2>
+```
+
+**Metrics/KPIs (data-type="metrics"):**
+```html
+<div class="pptx-metric">
+  <div class="pptx-metric-value">$1.2M</div>
+  <div class="pptx-metric-label">Total Revenue</div>
+  <div class="pptx-metric-change">+15% vs last month</div>
+</div>
+```
+
+**Bullet Points (data-type="bullets"):**
+```html
+<ul>
+  <li class="pptx-bullet">First key point</li>
+  <li class="pptx-bullet">Second key point</li>
+</ul>
+```
+
+**Insights/Takeaways:**
+```html
+<p class="pptx-insight">Key insight or takeaway text</p>
+```
+
+**Code Snippets (data-type="code"):**
+```html
+<pre class="pptx-code">SELECT * FROM sales</pre>
+```
+
+**Chart Placeholders (data-type="chart"):**
+```html
+<div class="pptx-chart" data-chart-type="bar">
+  <!-- Chart rendered by ECharts -->
+</div>
+```
+
+**Navigation (vanilla JS):**
+- Toggle `hidden` class to show/hide slides
+- Arrow keys: ArrowRight/Space = next, ArrowLeft = previous
+- Click navigation dots at bottom
+- Navigation arrows on edges
+
+**Design:**
+- Dark background (bg-slate-900) with light text
+- Each slide: `min-h-screen flex flex-col items-center justify-center`
+- Large typography, high contrast
+- One key insight per slide
+
+**Slide count:** 4-8 slides depending on data.
+
+**IMPORTANT:** Always include the pptx-* classes even if you add additional Tailwind classes.
+Example: `<h1 class="pptx-title text-6xl font-bold text-white">Title</h1>`
+
+═══════════════════════════════════════════════════════════════════════════════
+DESIGN REQUEST
+═══════════════════════════════════════════════════════════════════════════════
+
+**Report Title:** {report_title or title or 'Dashboard'}
+**Artifact Mode:** slides
 **User Request:** {user_prompt}
-{images_context}
-{f"**Organization Instructions:** {instructions_context}" if instructions_context else ""}
 
+{f"**Organization Instructions:**{chr(10)}{instructions_context}" if instructions_context else ""}
+
+{f"**Conversation History:**{chr(10)}{messages_context}" if messages_context else ""}
+
+{previous_artifacts_context}
 ═══════════════════════════════════════════════════════════════════════════════
-PYTHON-PPTX QUICK REFERENCE
-═══════════════════════════════════════════════════════════════════════════════
-
-**Setup (16:9 widescreen):**
-```python
-prs = Presentation()
-prs.slide_width = Inches(13.333)
-prs.slide_height = Inches(7.5)
-```
-
-**Add blank slide with dark background:**
-```python
-slide = prs.slides.add_slide(prs.slide_layouts[6])  # Blank layout
-background = slide.background
-fill = background.fill
-fill.solid()
-fill.fore_color.rgb = RGBColor(15, 23, 42)  # slate-900
-```
-
-**Add text box:**
-```python
-txBox = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(8), Inches(1))
-tf = txBox.text_frame
-tf.word_wrap = True
-p = tf.paragraphs[0]
-p.text = "Title Text"
-p.font.size = Pt(44)
-p.font.bold = True
-p.font.color.rgb = RGBColor(255, 255, 255)
-p.alignment = PP_ALIGN.CENTER
-```
-
-**Add BAR CHART (CRITICAL - use this for charts):**
-```python
-chart_data = CategoryChartData()
-chart_data.categories = ['Q1', 'Q2', 'Q3', 'Q4']
-chart_data.add_series('Revenue', (1.2, 1.5, 1.8, 2.1))
-
-x, y, cx, cy = Inches(1), Inches(2), Inches(11), Inches(5)
-chart = slide.shapes.add_chart(
-    XL_CHART_TYPE.BAR_CLUSTERED, x, y, cx, cy, chart_data
-).chart
-
-# Style the chart
-chart.has_legend = True
-chart.legend.position = XL_LEGEND_POSITION.BOTTOM
-chart.legend.include_in_layout = False
-plot = chart.plots[0]
-plot.has_data_labels = True
-```
-
-**Other chart types:**
-- XL_CHART_TYPE.COLUMN_CLUSTERED - vertical bars
-- XL_CHART_TYPE.LINE - line chart
-- XL_CHART_TYPE.PIE - pie chart
-- XL_CHART_TYPE.AREA - area chart
-
-**Dark background (slate-900 = RGB(15, 23, 42)):**
-```python
-from pptx.dml.color import RGBColor
-from pptx.enum.dml import MSO_THEME_COLOR
-background = slide.background
-fill = background.fill
-fill.solid()
-fill.fore_color.rgb = RGBColor(15, 23, 42)
-```
-
-**Access visualization data:**
-```python
-viz = visualizations[0]
-columns = viz['columns']  # e.g. ['AlbumTitle', 'Revenue', 'UnitsSold']
-rows = viz['rows']        # list of dicts like {{'AlbumTitle': 'Greatest Hits', 'Revenue': 1500.0}}
-
-# Get categories and values for a chart:
-categories = [str(row[columns[0]]) for row in rows]  # First column as labels
-values = [float(row[columns[1]]) if row[columns[1]] else 0 for row in rows]  # Second column as values
-
-# IMPORTANT: columns[i] returns a string like 'Revenue', then use that to index into row
-# row[columns[1]] is the same as row['Revenue'] if columns[1] == 'Revenue'
-```
-
-═══════════════════════════════════════════════════════════════════════════════
-DESIGN PHILOSOPHY - CREATE BEAUTIFUL, PROFESSIONAL SLIDES
+DESIGN PRINCIPLES
 ═══════════════════════════════════════════════════════════════════════════════
 
-**COLOR STRATEGY - Be Topic-Specific:**
-Choose colors that feel designed for THIS topic. If your colors would work for any presentation, you haven't made specific enough choices.
+Create something BEAUTIFUL. Think:
+- **Visual hierarchy** - What's the main story? Lead with it
+- **Whitespace** - Let elements breathe, don't crowd
+- **Color harmony** - Use a cohesive palette, accent colors for emphasis
+- **Typography** - Clear hierarchy, readable sizes
+- **Cards & containers** - Group related content, subtle shadows
+- **Micro-interactions** - Hover states, smooth transitions
+- **Data storytelling** - Choose chart types that reveal insights
 
-Structure: One DOMINANT color (60-70% visual weight), 1-2 supporting tones, one accent.
+Example slide patterns:
+- Slide 1: Title with report name, date, key metric teaser
+- Slide 2-3: Hero KPI cards with big numbers and trend indicators
+- Slide 4-5: Full-width charts with key insights as subtitles
+- Slide 6: Comparison or breakdown visualization
+- Slide 7: Summary with key takeaways as bullet points
 
-Example palettes (pick one that fits the topic):
-- **Midnight Executive**: Navy (0,31,63), Steel (119,136,153), Gold accent (212,175,55)
-- **Forest & Moss**: Deep green (34,87,76), Sage (138,154,91), Cream (245,245,220)
-- **Coral Energy**: Coral (255,127,80), Teal (0,128,128), Sand (244,232,214)
-- **Ocean Depths**: Deep blue (0,51,102), Aqua (0,180,180), Pearl (240,248,255)
-- **Sunset Warm**: Burgundy (128,0,32), Orange (255,140,0), Cream (255,253,240)
-- **Modern Minimal**: Charcoal (54,69,79), Light gray (220,220,220), Teal accent (0,150,136)
-
-**LAYOUT VARIETY - Never Repeat:**
-Every slide MUST have visual elements - charts, shapes, or decorative elements. NO text-only slides.
-
-Vary layouts between:
-- Two-column (text left, chart right or vice versa)
-- Full-width chart with title above
-- KPI cards in a row (3-4 metric boxes)
-- Chart with callout boxes for key insights
-- Split layout with accent shape dividers
-
-**TYPOGRAPHY:**
-- Titles: 36-44pt bold, interesting positioning (not always centered)
-- Body text: 18-24pt, LEFT-aligned (never center-align body text)
-- KPI numbers: 48-72pt bold for impact
-- Use font color contrast: white on dark, dark on light accents
-
-**VISUAL ELEMENTS TO ADD:**
-- Accent shapes: rectangles, rounded rectangles for backgrounds
-- Divider lines or shapes between sections
-- Colored boxes behind KPI numbers
-- Subtle shape overlays for visual interest
-
-**COMMON MISTAKES TO AVOID:**
-- ⚠️ Using `value.inches` instead of `Inches(value)` - Inches/Pt/Emu are FUNCTIONS!
-- Repeating the same layout across slides (VARY IT!)
-- Center-aligning body text (use LEFT alignment)
-- Using only blue without topic-specific reasoning
-- Creating text-only slides without visual elements
-- Accent lines directly under titles (hallmark of generic slides)
-- Cramming too much data - limit charts to top 8-10 items
-
-**TECHNICAL REQUIREMENTS:**
-1. Define `generate_slides(visualizations, report)` returning a Presentation
-2. Use 16:9 widescreen: Inches(13.333) x Inches(7.5)
-3. Create REAL charts with slide.shapes.add_chart() + CategoryChartData
-4. Use visualization data from the visualizations list
-5. Margins: start shapes at Inches(0.75) to Inches(1) from edges
+**DO NOT include:**
+- Report IDs, UUIDs, or technical identifiers (e.g., "ID 0c6a0483-6876...")
+- Branding badges or watermarks
+- Footer credits or attribution text
 
 ═══════════════════════════════════════════════════════════════════════════════
-OUTPUT FORMAT - Example with Design Principles Applied
+OUTPUT FORMAT
 ═══════════════════════════════════════════════════════════════════════════════
 
-```python
-def generate_slides(visualizations, report):
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
+```html
+<!-- Slides Container -->
+<div id="slides-container" class="relative w-full h-screen overflow-hidden bg-slate-900">
 
-    # Color palette - choose colors that fit the topic
-    PRIMARY = RGBColor(0, 51, 102)      # Deep blue
-    SECONDARY = RGBColor(0, 128, 128)   # Teal
-    ACCENT = RGBColor(255, 140, 0)      # Orange accent
-    BG_DARK = RGBColor(15, 23, 42)      # Dark background
-    TEXT_LIGHT = RGBColor(255, 255, 255)
-    TEXT_MUTED = RGBColor(148, 163, 184)
+  <!-- Slide 0: Title -->
+  <section class="slide min-h-screen flex flex-col items-center justify-center px-8" data-slide="0" data-type="title">
+    <h1 class="pptx-title text-6xl font-bold text-white text-center">Monthly Sales Report</h1>
+    <p class="pptx-subtitle text-2xl text-slate-400 mt-4">January 2025 Performance Review</p>
+  </section>
 
-    def set_background(slide, color=BG_DARK):
-        bg = slide.background
-        fill = bg.fill
-        fill.solid()
-        fill.fore_color.rgb = color
+  <!-- Slide 1: Metrics -->
+  <section class="slide min-h-screen flex flex-col items-center justify-center px-8 hidden" data-slide="1" data-type="metrics">
+    <h2 class="pptx-heading text-4xl font-bold text-white mb-12">Key Metrics</h2>
+    <div class="flex gap-8">
+      <div class="pptx-metric text-center">
+        <div class="pptx-metric-value text-5xl font-bold text-white">$1.2M</div>
+        <div class="pptx-metric-label text-slate-400 mt-2">Total Revenue</div>
+        <div class="pptx-metric-change text-green-400 text-sm mt-1">+15% vs last month</div>
+      </div>
+      <div class="pptx-metric text-center">
+        <div class="pptx-metric-value text-5xl font-bold text-white">2,450</div>
+        <div class="pptx-metric-label text-slate-400 mt-2">Orders</div>
+        <div class="pptx-metric-change text-green-400 text-sm mt-1">+8%</div>
+      </div>
+    </div>
+  </section>
 
-    def add_accent_shape(slide, left, top, width, height, color):
-        shape = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, left, top, width, height)
-        shape.fill.solid()
-        shape.fill.fore_color.rgb = color
-        shape.line.fill.background()
-        return shape
+  <!-- Slide 2: Key Points -->
+  <section class="slide min-h-screen flex flex-col items-center justify-center px-8 hidden" data-slide="2" data-type="bullets">
+    <h2 class="pptx-heading text-4xl font-bold text-white mb-8">Key Insights</h2>
+    <ul class="space-y-4">
+      <li class="pptx-bullet text-xl text-white">Revenue grew 15% compared to last quarter</li>
+      <li class="pptx-bullet text-xl text-white">Customer retention improved by 12%</li>
+      <li class="pptx-bullet text-xl text-white">New product line exceeded expectations</li>
+    </ul>
+    <p class="pptx-insight text-lg text-blue-400 mt-8 italic">Overall performance exceeded targets across all metrics</p>
+  </section>
 
-    # ═══════════════════════════════════════════════════════════════
-    # SLIDE 1: Title with accent shape
-    # ═══════════════════════════════════════════════════════════════
-    slide = prs.slides.add_slide(prs.slide_layouts[6])
-    set_background(slide)
+  <!-- Navigation Dots -->
+  <div class="fixed bottom-8 left-1/2 -translate-x-1/2 flex gap-2">
+    <button class="nav-dot w-3 h-3 rounded-full bg-white" data-goto="0"></button>
+    <button class="nav-dot w-3 h-3 rounded-full bg-white/30" data-goto="1"></button>
+    <button class="nav-dot w-3 h-3 rounded-full bg-white/30" data-goto="2"></button>
+  </div>
 
-    # Accent shape behind title
-    add_accent_shape(slide, Inches(0), Inches(2.5), Inches(5), Inches(2.5), PRIMARY)
+  <!-- Arrow Navigation -->
+  <button id="prev-btn" class="fixed left-4 top-1/2 -translate-y-1/2 text-white/50 hover:text-white text-4xl">&larr;</button>
+  <button id="next-btn" class="fixed right-4 top-1/2 -translate-y-1/2 text-white/50 hover:text-white text-4xl">&rarr;</button>
+</div>
 
-    title_box = slide.shapes.add_textbox(Inches(0.75), Inches(3), Inches(12), Inches(1.5))
-    tf = title_box.text_frame
-    p = tf.paragraphs[0]
-    p.text = report.get('title', 'Presentation')
-    p.font.size = Pt(48)
-    p.font.bold = True
-    p.font.color.rgb = TEXT_LIGHT
+<script>
+  let currentSlide = 0;
+  const slides = document.querySelectorAll('.slide');
+  const dots = document.querySelectorAll('.nav-dot');
+  const totalSlides = slides.length;
 
-    # ═══════════════════════════════════════════════════════════════
-    # SLIDE 2: KPI Cards Row (if we have numeric data)
-    # ═══════════════════════════════════════════════════════════════
-    if visualizations and visualizations[0].get('rows'):
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
-        set_background(slide)
+  function showSlide(index) {{
+    slides.forEach((s, i) => s.classList.toggle('hidden', i !== index));
+    dots.forEach((d, i) => {{
+      d.classList.toggle('bg-white', i === index);
+      d.classList.toggle('bg-white/30', i !== index);
+    }});
+    currentSlide = index;
+  }}
 
-        viz = visualizations[0]
-        rows = viz.get('rows', [])
-        columns = viz.get('columns', [])
+  document.getElementById('prev-btn').onclick = () => showSlide(Math.max(0, currentSlide - 1));
+  document.getElementById('next-btn').onclick = () => showSlide(Math.min(totalSlides - 1, currentSlide + 1));
+  dots.forEach(d => d.onclick = () => showSlide(parseInt(d.dataset.goto)));
 
-        # Create 3 KPI cards across the slide
-        card_width = Inches(3.5)
-        card_height = Inches(2.5)
-        start_x = Inches(1)
-        card_y = Inches(2.5)
-        gap = Inches(0.5)
-
-        for i, col in enumerate(columns[:3]):
-            if i >= 3:
-                break
-            x = start_x + i * (card_width + gap)
-
-            # Card background
-            card = add_accent_shape(slide, x, card_y, card_width, card_height, PRIMARY)
-
-            # Value (large number)
-            val = rows[0].get(col, 0) if rows else 0
-            val_box = slide.shapes.add_textbox(x + Inches(0.3), card_y + Inches(0.5), card_width - Inches(0.6), Inches(1.2))
-            tf = val_box.text_frame
-            p = tf.paragraphs[0]
-            p.text = "{{:,.0f}}".format(float(val)) if isinstance(val, (int, float)) else str(val)
-            p.font.size = Pt(36)
-            p.font.bold = True
-            p.font.color.rgb = TEXT_LIGHT
-
-            # Label
-            label_box = slide.shapes.add_textbox(x + Inches(0.3), card_y + Inches(1.7), card_width - Inches(0.6), Inches(0.6))
-            tf = label_box.text_frame
-            p = tf.paragraphs[0]
-            p.text = col
-            p.font.size = Pt(14)
-            p.font.color.rgb = TEXT_MUTED
-
-    # ═══════════════════════════════════════════════════════════════
-    # SLIDE 3: Chart with title (different layout)
-    # ═══════════════════════════════════════════════════════════════
-    if visualizations:
-        viz = visualizations[0]
-        columns = viz.get('columns', [])
-        rows = viz.get('rows', [])
-
-        if len(columns) >= 2 and rows:
-            slide = prs.slides.add_slide(prs.slide_layouts[6])
-            set_background(slide)
-
-            # Title on left side
-            title_box = slide.shapes.add_textbox(Inches(0.75), Inches(0.5), Inches(5), Inches(1))
-            tf = title_box.text_frame
-            p = tf.paragraphs[0]
-            p.text = viz.get('title', 'Data Analysis')
-            p.font.size = Pt(32)
-            p.font.bold = True
-            p.font.color.rgb = TEXT_LIGHT
-
-            # Extract data
-            col_label = columns[0]
-            col_value = columns[1]
-            categories = [str(row.get(col_label, ''))[:20] for row in rows[:8]]
-            values = [float(row.get(col_value, 0) or 0) for row in rows[:8]]
-
-            # Chart (full width below title)
-            chart_data = CategoryChartData()
-            chart_data.categories = categories
-            chart_data.add_series(col_value, tuple(values))
-
-            chart = slide.shapes.add_chart(
-                XL_CHART_TYPE.BAR_CLUSTERED,
-                Inches(0.75), Inches(1.5), Inches(11.833), Inches(5.5),
-                chart_data
-            ).chart
-            chart.has_legend = False
-
-    return prs
-
-# Execute and save
-prs = generate_slides(visualizations, report)
-prs.save(_pptx_output_path)
+  document.addEventListener('keydown', (e) => {{
+    if (e.key === 'ArrowRight' || e.key === ' ') showSlide(Math.min(totalSlides - 1, currentSlide + 1));
+    if (e.key === 'ArrowLeft') showSlide(Math.max(0, currentSlide - 1));
+  }});
+</script>
 ```
 
-Create a beautiful, varied presentation following these design principles. Each slide should look DIFFERENT from the others. Use visual elements, accent shapes, and thoughtful color choices:"""
+REQUIREMENTS:
+1. Output HTML code only (NO React/Babel - pure HTML + vanilla JS)
+2. Use `<section class="slide">` for each slide with `data-slide="N"` attribute
+3. First slide visible, others have `hidden` class
+4. Include navigation: dots at bottom, arrow buttons on sides
+5. Include vanilla JS for keyboard navigation (arrows, space)
+6. Access data via `window.ARTIFACT_DATA` directly (no React hooks)
+7. Each slide: `min-h-screen flex flex-col items-center justify-center`
+8. Dark theme: bg-slate-900 background, white/slate text
+9. Make it GORGEOUS - this is a presentation showcase
+
+DO NOT use React, Babel, JSX, or any framework - PURE HTML + Tailwind + vanilla JavaScript only.
+
+Now create the slide presentation:"""
 
     def _build_page_prompt(
         self,
@@ -1349,18 +1250,19 @@ Create a beautiful, varied presentation following these design principles. Each 
         report_title: str | None,
         allow_llm_see_data: bool,
         messages_context: str = "",
-        image_count: int = 0,
+        previous_artifacts: List[Dict[str, Any]] | None = None,
     ) -> str:
         """Build the prompt for generating page/dashboard (React + ECharts)."""
         viz_json = json.dumps(viz_profiles, indent=2, default=str)
 
-        # Build attached images context
-        images_context = ""
-        if image_count > 0:
-            images_context = f"\n**Attached Images:** {image_count} image(s) provided for visual reference. Use these to understand the design intent, branding, color schemes, or layout preferences the user wants to incorporate."
-
-        # Note: Previous artifact code is now available via observation context (from create_artifact/read_artifact)
-        # The planner can call read_artifact if needed to load previous code into context
+        # Build previous artifacts context
+        previous_artifacts_context = ""
+        if previous_artifacts:
+            previous_artifacts_context = "\n═══════════════════════════════════════════════════════════════════════════════\nPREVIOUS ARTIFACTS (for reference/iteration)\n═══════════════════════════════════════════════════════════════════════════════\n\nThe user may want to modify or build upon these existing artifacts. Reference them if the user asks to change, update, or improve something:\n\n"
+            for i, art in enumerate(previous_artifacts):
+                previous_artifacts_context += f"**Artifact {i+1}: {art.get('title', 'Untitled')}** (ID: {art.get('id')})\n"
+                if art.get('code'):
+                    previous_artifacts_context += f"```jsx\n{art.get('code')}\n```\n\n"
 
         return f"""You are a world-class frontend developer and data visualization expert. Create a STUNNING, publication-quality dashboard.
 
@@ -1444,11 +1346,12 @@ DESIGN REQUEST
 **Report Title:** {report_title or title or 'Dashboard'}
 **Artifact Mode:** page
 **User Request:** {user_prompt}
-{images_context}
+
 {f"**Organization Instructions:**{chr(10)}{instructions_context}" if instructions_context else ""}
 
 {f"**Conversation History:**{chr(10)}{messages_context}" if messages_context else ""}
 
+{previous_artifacts_context}
 ═══════════════════════════════════════════════════════════════════════════════
 DESIGN PRINCIPLES
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1462,7 +1365,7 @@ Create a polished, executive-ready dashboard. Think:
 - **Generous whitespace** - Let elements breathe, use padding liberally
 - **Clean typography** - Simple, readable fonts. No fancy headers or badges
 - **Subtle containers** - Light borders or shadows, not heavy cards
-- **Beautiful, colorful charts** - Use vibrant but harmonious color palettes for data visualization. By default use light mode unless the user/instructions indicate dark theme
+- **Beautiful, colorful charts** - Use vibrant but harmonious color palettes for data visualization
 - **Professional feel** - Like a Bloomberg terminal or modern analytics platform
 - **Data-focused** - The data is the star, UI should support not distract
 **Color Guidelines for Charts:**
@@ -1470,69 +1373,6 @@ Create a polished, executive-ready dashboard. Think:
 - Apply smooth gradients for area charts and backgrounds
 - Ensure sufficient contrast for readability
 - Use color consistently across related metrics
-
-═══════════════════════════════════════════════════════════════════════════════
-CROSS-VISUALIZATION FILTERS
-═══════════════════════════════════════════════════════════════════════════════
-
-If visualizations have `filterable_columns` in their profile, implement cross-visualization filters.
-
-**Architecture:**
-- Store filter state in App with `useState` — one object mapping field names to selected values (or `null` for "All")
-- Pass filters down to every chart/table component. Each component filters its own `rows` before rendering.
-- Render the filter bar as a **sticky/fixed row at the top** with `z-50` so it stays above all charts.
-
-**Implementation pattern:**
-```jsx
-// In App:
-const [filters, setFilters] = React.useState({{}});
-
-// Collect filterable columns across all visualizations
-const filterableColumns = React.useMemo(() => {{
-  const seen = new Set();
-  const cols = [];
-  data.visualizations.forEach(viz => {{
-    (viz.filterable_columns || []).forEach(fc => {{
-      if (!seen.has(fc.field)) {{
-        seen.add(fc.field);
-        cols.push(fc);
-      }}
-    }});
-  }});
-  return cols;
-}}, [data]);
-
-// Filter function — reuse in every chart component
-const filterRows = (rows) => {{
-  return rows.filter(row =>
-    Object.entries(filters).every(([field, value]) =>
-      value == null || String(row[field]) === value
-    )
-  );
-}};
-
-// Filter bar UI (sticky, above charts)
-<div className="sticky top-0 z-50 bg-white/95 backdrop-blur border-b px-6 py-3 flex gap-4 flex-wrap">
-  {{filterableColumns.map(fc => (
-    <select key={{fc.field}} value={{filters[fc.field] || ""}}
-      onChange={{e => setFilters(f => ({{...f, [fc.field]: e.target.value || null}}))}}
-      className="px-3 py-1.5 rounded-lg border text-sm">
-      <option value="">{{fc.field}}: All</option>
-      {{fc.unique_values.map(v => <option key={{v}} value={{v}}>{{v}}</option>)}}
-    </select>
-  ))}}
-</div>
-
-// In each chart component, always use filterRows(viz.rows) instead of viz.rows directly
-```
-
-**Rules:**
-- Only show filters if `filterable_columns` exist in the data
-- Filter bar must be `sticky top-0 z-50` — always visible above chart canvases
-- Every chart/table must respect active filters
-- Include a visual indicator of active filters and a "Reset" option
-- When multiple visualizations share a filterable column with the same field name, that filter MUST operate across ALL visualizations simultaneously. A filter for "Country" should filter every chart and table that has a "Country" column, not just one. If a visualization does not have the filtered column, it should remain unaffected (show all its data).
-- After filtering, if a visualization has zero matching rows, display a friendly "No data matches current filters" message instead of rendering a broken or empty chart.
 
 **DO NOT include:**
 - Report IDs, UUIDs, or technical identifiers (e.g., "ID 0c6a0483-6876...")
@@ -1581,7 +1421,6 @@ REQUIREMENTS:
 6. Style: Minimalist, clean, professional - no branding badges or decorative headers -- BUT NOT BORING AND TEMPLATE LIKE!
 7. Charts must be beautiful with vibrant, harmonious colors, gradients, and smooth animations
 8. ALL displayed values must come from data.visualizations[N].rows - no placeholder data
-9. Handle edge cases gracefully: if a visualization has zero rows after filtering, show "No data matches the current filters" instead of a broken chart. If a column value is null or undefined, skip it rather than crashing. Wrap ECharts initialization in try/catch so a single broken chart does not take down the entire dashboard.
 
 Example loading state:
 ```jsx
@@ -1598,7 +1437,6 @@ if (!data) {{
 - Extract ALL values from `data.visualizations` - never write literal numbers or strings
 - Keep it minimal and professional - no decorative text, badges, or branding
 - Use beautiful, colorful charts with vibrant palettes
-- Pay close attention to the user's specific requests in the conversation history and the prompt. If they mention specific colors, layouts, chart types, or data points to highlight, follow those instructions precisely. The user's explicit request takes priority over default design choices. Do not override user preferences with your own aesthetic judgment.
 
 Now create the dashboard:"""
 
@@ -1612,7 +1450,7 @@ Now create the dashboard:"""
         report_title: str | None,
         allow_llm_see_data: bool,
         messages_context: str = "",
-        image_count: int = 0,
+        previous_artifacts: List[Dict[str, Any]] | None = None,
     ) -> str:
         """Build the prompt for generating artifact code. Dispatches to mode-specific builders."""
         if mode == "slides":
@@ -1624,7 +1462,7 @@ Now create the dashboard:"""
                 report_title=report_title,
                 allow_llm_see_data=allow_llm_see_data,
                 messages_context=messages_context,
-                image_count=image_count,
+                previous_artifacts=previous_artifacts,
             )
         return self._build_page_prompt(
             user_prompt=user_prompt,
@@ -1634,17 +1472,17 @@ Now create the dashboard:"""
             report_title=report_title,
             allow_llm_see_data=allow_llm_see_data,
             messages_context=messages_context,
-            image_count=image_count,
+            previous_artifacts=previous_artifacts,
         )
 
     def _extract_code(self, response: str, mode: str = "page") -> str:
         """Extract the code from the LLM response.
 
         For 'page' mode: Extract React code from <script type="text/babel"> tags
-        For 'slides' mode: Extract python-pptx code from python code blocks
+        For 'slides' mode: Extract HTML content (everything after the JSON block)
         """
         if mode == "slides":
-            return self._extract_slides_python(response)
+            return self._extract_slides_html(response)
 
         # Dashboard mode - extract React code from script tags
         start_marker = "<script type=\"text/babel\">"
@@ -1668,32 +1506,26 @@ Now create the dashboard:"""
 
         return code
 
-    def _extract_slides_python(self, response: str) -> str:
-        """Extract python-pptx code for slides mode."""
+    def _extract_slides_html(self, response: str) -> str:
+        """Extract HTML content for slides mode."""
         import re
 
-        # Try to find Python code block
-        python_match = re.search(r'```python\s*([\s\S]*?)```', response)
-        if python_match:
-            return python_match.group(1).strip()
+        # Try to find HTML code block
+        html_match = re.search(r'```html?\s*([\s\S]*?)```', response)
+        if html_match:
+            return html_match.group(1).strip()
 
-        # Try generic code block
-        code_match = re.search(r'```\s*([\s\S]*?)```', response)
-        if code_match:
-            return code_match.group(1).strip()
+        # Look for the slides container div
+        div_start = response.find('<div id="slides-container"')
+        if div_start == -1:
+            div_start = response.find('<div class="')
 
-        # Look for function definition as start marker
-        func_start = response.find('def generate_slides')
-        if func_start != -1:
-            # Find the prs.save() call at the end
-            save_end = response.rfind('prs.save(')
-            if save_end != -1:
-                # Include the full save line
-                end_idx = response.find(')', save_end)
-                if end_idx != -1:
-                    return response[func_start:end_idx + 1].strip()
-            return response[func_start:].strip()
+        if div_start != -1:
+            # Find the matching closing and script
+            script_end = response.rfind('</script>')
+            if script_end != -1:
+                return response[div_start:script_end + 9].strip()
+            return response[div_start:].strip()
 
         # Fallback: return the response as-is
         return response.strip()
-
