@@ -34,7 +34,6 @@ from app.core.cors import init_cors
 from app.core.scheduler import scheduler
 from app.models.user import User
 from app.services.maintenance_service import purge_step_payloads_keep_latest_per_query
-from app.core.otel import setup_telemetry, instrument_app
 
 from app.routes import (
     report,
@@ -74,7 +73,6 @@ from app.routes import (
     build,
     connection,
     artifact,
-    oauth_server,
 )
 from app.routes.oidc_auth import router as oidc_auth_router
 from app.ee.routes import router as enterprise_router
@@ -83,8 +81,7 @@ from app.ee.license import get_license_info
 # Initialize logging
 loggers = setup_logging()
 logger = get_logger(__name__)
-# Initialize OpenTelemetry if enabled (before app creation)
-setup_telemetry(settings.bow_config.otel)
+
 # Read configuration
 enable_google_oauth = settings.bow_config.google_oauth.enabled
 google_client_id = settings.bow_config.google_oauth.client_id
@@ -111,8 +108,6 @@ app = FastAPI(
     swagger_ui_oauth2_redirect_url="/api/auth/jwt/login"
 )
 
-# Instrument FastAPI with OpenTelemetry
-instrument_app(app, settings.bow_config.otel)
 init_cors(app)
 
 oauth_providers = []
@@ -204,8 +199,6 @@ app.include_router(user_data_source_credentials.router, prefix="/api")
 app.include_router(mentions.router, prefix="/api")
 app.include_router(api_key.router, prefix="/api")
 app.include_router(mcp.router, prefix="/api")
-app.include_router(oauth_server.well_known_router)  # /.well-known/* at root
-app.include_router(oauth_server.router, prefix="/api")  # /api/oauth/*
 app.include_router(connection.router, prefix="/api")
 app.include_router(artifact.router, prefix="/api")
 app.include_router(enterprise_router, prefix="/api")
@@ -218,7 +211,7 @@ def custom_openapi():
     openapi_schema = get_openapi(
         title=settings.PROJECT_NAME,
         version=settings.PROJECT_VERSION,
-        description="Bag of Words API",
+        description=f"{settings.PROJECT_NAME} API",
         routes=app.routes,
     )
 
@@ -357,7 +350,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=int(os.getenv("PORT", 8000)),
         reload=True,
         workers=20
     )
