@@ -24,3 +24,10 @@ encryption_key: ${BOW_ENCRYPTION_KEY}
 
 intercom:
   enabled: false
+  app_id: ${BOW_INTERCOM_APP_ID}
+
+telemetry:
+  enabled: false
+  provider: "posthog"
+  host: ${BOW_POSTHOG_HOST}
+  posthog_api_key: ${BOW_POSTHOG_API_KEY}
