@@ -17,6 +17,7 @@ ORIGIN_REMOTE="${ORIGIN_REMOTE:-origin}"
 SYNC_MODE="${SYNC_MODE:-merge}"
 CUSTOM_SOURCE_BRANCH="${CUSTOM_SOURCE_BRANCH:-$DEV_BRANCH}"
 MANAGED_PATHS_FILE="${MANAGED_PATHS_FILE:-branding/managed-paths.txt}"
+PIN_WORKFLOW_DIR_TO_SOURCE="${PIN_WORKFLOW_DIR_TO_SOURCE:-true}"
 
 AUTO_PUSH="${AUTO_PUSH:-false}"
 AUTO_PR="${AUTO_PR:-false}"
@@ -87,6 +88,7 @@ if [[ "$ALLOW_DIRTY_WORKTREE" == "true" && "$WORKTREE_REEXEC" != "true" ]]; then
     SYNC_MODE="$SYNC_MODE" \
     CUSTOM_SOURCE_BRANCH="$CUSTOM_SOURCE_BRANCH" \
     MANAGED_PATHS_FILE="$MANAGED_PATHS_FILE" \
+    PIN_WORKFLOW_DIR_TO_SOURCE="$PIN_WORKFLOW_DIR_TO_SOURCE" \
     ALLOW_OFFLINE="$ALLOW_OFFLINE" \
     ALLOW_DIRTY_WORKTREE="false" \
     WORKTREE_REEXEC="true" \
@@ -323,12 +325,24 @@ if [[ "$SYNC_MODE" == "rebuild" ]]; then
     git checkout "$CUSTOM_SOURCE_BRANCH" -- "${existing_paths[@]}"
   fi
 
+  workflow_dir_pin_status="disabled"
+  if [[ "$PIN_WORKFLOW_DIR_TO_SOURCE" == "true" ]]; then
+    if git cat-file -e "$CUSTOM_SOURCE_BRANCH:.github/workflows" 2>/dev/null; then
+      # Keep workflow files identical to the source branch so GitHub Actions can
+      # push sync branches with GITHUB_TOKEN even when upstream changes workflows.
+      git checkout "$CUSTOM_SOURCE_BRANCH" -- .github/workflows
+      workflow_dir_pin_status="source-branch"
+    else
+      workflow_dir_pin_status="source-missing"
+    fi
+  fi
+
   managed_paths_missing_preview="none"
   if [[ "${#missing_paths[@]}" -gt 0 ]]; then
     managed_paths_missing_preview="$(printf '%s\n' "${missing_paths[@]}" | head -n 20 | tr '\n' '; ' | sed 's/; $//')"
   fi
 
-  SYNC_STRATEGY_NOTES="- Mode: \`rebuild\`"$'\n'"- Source branch: \`$CUSTOM_SOURCE_BRANCH\`"$'\n'"- Managed paths file: \`$MANAGED_PATHS_FILE\`"
+  SYNC_STRATEGY_NOTES="- Mode: \`rebuild\`"$'\n'"- Source branch: \`$CUSTOM_SOURCE_BRANCH\`"$'\n'"- Managed paths file: \`$MANAGED_PATHS_FILE\`"$'\n'"- Workflow dir pinned to source branch: \`$workflow_dir_pin_status\`"
   MANAGED_PATHS_REPORT="- Managed entries: \`${#managed_paths[@]}\`"$'\n'"- Applied from source branch: \`${#existing_paths[@]}\`"$'\n'"- Missing in source branch: \`${#missing_paths[@]}\`"$'\n'"- Missing preview: \`${managed_paths_missing_preview}\`"
 else
   git checkout "$DEV_BRANCH"
