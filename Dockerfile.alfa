@@ -1,0 +1,147 @@
+# =========================================================
+# STAGE 1: Backend Builder (Compiles Python dependencies)
+# =========================================================
+FROM ubuntu:24.04 AS backend-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies for building Python packages
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+      python3 \
+      python3-pip \
+      python3-venv \
+      python3-dev \
+      build-essential \
+      libpq-dev \
+      gcc \
+      unixodbc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set backend directory
+WORKDIR /app/backend
+
+# Copy backend code
+COPY ./backend /app/backend
+RUN rm -f /app/backend/db/app.db
+
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Install Python requirements
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    python3 -m pip install --no-cache-dir --prefer-binary -r requirements_versioned.txt
+
+# =========================================================
+# STAGE 2: Frontend Builder (Builds your Custom UI)
+# =========================================================
+FROM ubuntu:24.04 AS frontend-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install Node.js 20 (We switched to 20 to fix the build error)
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs git && \
+    npm install --global yarn@1.22.22 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy config files
+COPY ./VERSION /app/VERSION
+COPY ./bow-config.yaml /app/bow-config.yaml
+
+# -------------------------------------------------------
+# CRITICAL CHANGE: Copy 'frontend-custom' instead of 'frontend'
+# We rename it to 'frontend' inside the container so scripts still work.
+# -------------------------------------------------------
+COPY ./frontend-custom /app/frontend
+
+WORKDIR /app/frontend
+
+# Install and Build
+RUN yarn install --frozen-lockfile
+RUN yarn build
+
+# =========================================================
+# STAGE 3: Final Runtime Image
+# =========================================================
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Install Runtime Dependencies (Python, Node, ODBC Drivers)
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg git openssh-client python3 python3-venv tini libpq5 && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    curl -sSL -o /tmp/packages-microsoft-prod.deb https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb && \
+    dpkg -i /tmp/packages-microsoft-prod.deb && rm /tmp/packages-microsoft-prod.deb && \
+    apt-get update && \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 mssql-tools18 unixodbc && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Create 'app' user for security
+RUN groupadd -r app \
+    && useradd -r -g app -m -d /home/app -s /usr/sbin/nologin app \
+    && mkdir -p /home/app /app/backend/db /app/frontend /app/frontend/public \
+    && chown -R app:app /app /home/app
+
+# Copy Backend Environment from Stage 1
+COPY --from=backend-builder --chown=app:app /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY --from=backend-builder --chown=app:app /app/backend /app/backend
+
+# Copy Demo Data
+COPY --chown=app:app ./backend/demo-datasources /app/backend/demo-datasources
+
+# Copy Frontend Build from Stage 2 (This is your Custom UI)
+COPY --from=frontend-builder --chown=app:app /app/frontend/.output /app/frontend/.output
+
+# Sandbox HTML is required by backend create_artifact runtime validation.
+COPY --chown=app:app ./frontend-custom/public/artifact-sandbox.html /app/frontend/public/artifact-sandbox.html
+
+# Copy Configs & Scripts
+COPY --chown=app:app ./backend/requirements_versioned.txt /app/backend/
+COPY --chown=app:app ./VERSION /app/VERSION
+COPY --chown=app:app ./start.sh /app/start.sh
+COPY --chown=app:app ./bow-config.yaml /app/bow-config.yaml
+
+# Create necessary writable directories
+RUN mkdir -p /app/backend/uploads/files /app/backend/uploads/branding /app/backend/logs && \
+    chown -R app:app /app
+
+WORKDIR /app
+
+# Set permissions
+RUN chmod +x /app/start.sh
+
+# Environment Variables
+ENV NODE_ENV=production
+ENV ENVIRONMENT=production
+ENV GIT_PYTHON_REFRESH=quiet
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONIOENCODING=UTF-8
+ENV HOME=/home/app
+
+EXPOSE 3000
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD curl -fsS http://localhost:3000/ || exit 1
+
+USER app
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/bin/bash", "start.sh"]
