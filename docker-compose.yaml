@@ -13,7 +13,6 @@
 #   POSTGRES_PASSWORD=your_secure_pw      # PostgreSQL password (CHANGE THIS!)
 #   POSTGRES_DB=bagofwords                # Database name
 #   BOW_ENCRYPTION_KEY=                   # Fernet encryption key (44 chars, ends with =)
-#   BOW_LICENSE_KEY=                      # Enterprise license key (optional)
 #
 # Generate encryption key:
 #   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -43,23 +42,31 @@ services:
       - bow-network
 
   app:
-    image: bagofwords/bagofwords:latest
-    pull_policy: always
+    build:
+      context: .
+      dockerfile: Dockerfile.alfa
     container_name: bow-app
     restart: unless-stopped
-    expose:
-      - "3000"
+    ports:
+      - "8003:8000"
     environment:
       - NODE_ENV=production
       - ENVIRONMENT=production
+      - DOMAIN=${DOMAIN}
       # Database configuration
-      - BOW_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-bowpassword}@postgres:5432/${POSTGRES_DB:-bagofwords}
+      - BOW_DATABASE_URL=${BOW_DATABASE_URL}
       # Encryption key
-      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}
-      # Enterprise license key (optional)
-      - BOW_LICENSE_KEY=${BOW_LICENSE_KEY:-}
+      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY}
       # Config path
       - BOW_CONFIG_PATH=/app/bow-config.yaml
+      # Dynamic Port for Nuxt
+      - BACKEND_PORT=8000
+      # SMTP
+      - BOW_SMTP_PASSWORD=${BOW_SMTP_PASSWORD}
+      - BOW_SMTP_HOST=${BOW_SMTP_HOST}
+      - BOW_SMTP_USER=${BOW_SMTP_USER}
+      - BOW_SMTP_PORT=${BOW_SMTP_PORT}
+      - BOW_SMTP_FROM=${BOW_SMTP_FROM}
     volumes:
       - ./bow-config.yaml:/app/bow-config.yaml:ro
       - uploads_data:/app/backend/uploads
