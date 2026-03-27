@@ -24,6 +24,9 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-latest
+    environment:
+      name: production-approval
+      url: https://analyst.alfastack.cloud
     concurrency:
       group: alfastack-production-promotion
       cancel-in-progress: false
