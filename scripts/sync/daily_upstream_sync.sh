@@ -445,24 +445,36 @@ TELEMETRY_STATUS="$(awk '
 ' bow-config.yaml | head -n1)"
 
 if [[ "$RUN_TESTS" == "true" ]]; then
-  if (cd backend && TESTING=true ENVIRONMENT=production BOW_SMTP_PORT="${BOW_SMTP_PORT:-587}" pytest -q tests/e2e/test_mcp.py >/tmp/alfastack-daily-pytest.log 2>&1); then
-    TEST_RESULTS="PASS (backend/tests/e2e/test_mcp.py)"
-    test_output="$(cat /tmp/alfastack-daily-pytest.log)"
+  if (cd backend && python -m pip install -r requirements_versioned.txt >/tmp/alfastack-daily-pytest-install.log 2>&1); then
+    if (cd backend && TESTING=true ENVIRONMENT=production BOW_SMTP_PORT="${BOW_SMTP_PORT:-587}" python -m pytest -q tests/e2e/test_mcp.py >/tmp/alfastack-daily-pytest.log 2>&1); then
+      TEST_RESULTS="PASS (backend/tests/e2e/test_mcp.py)"
+      test_output="$(cat /tmp/alfastack-daily-pytest.log)"
+    else
+      GATE_FAILED=true
+      TEST_RESULTS="FAIL (backend/tests/e2e/test_mcp.py)"
+      test_output="$(cat /tmp/alfastack-daily-pytest.log)"
+    fi
   else
     GATE_FAILED=true
-    TEST_RESULTS="FAIL (backend/tests/e2e/test_mcp.py)"
-    test_output="$(cat /tmp/alfastack-daily-pytest.log)"
+    TEST_RESULTS="FAIL (backend dependency refresh)"
+    test_output="$(cat /tmp/alfastack-daily-pytest-install.log)"
   fi
 fi
 
 if [[ "$RUN_FRONTEND_BUILD" == "true" ]]; then
-  if (cd frontend-custom && yarn build >/tmp/alfastack-daily-frontend-build.log 2>&1); then
-    BUILD_RESULTS="PASS (frontend-custom yarn build)"
-    build_output="$(cat /tmp/alfastack-daily-frontend-build.log)"
+  if (cd frontend-custom && yarn install --frozen-lockfile >/tmp/alfastack-daily-frontend-install.log 2>&1); then
+    if (cd frontend-custom && yarn build >/tmp/alfastack-daily-frontend-build.log 2>&1); then
+      BUILD_RESULTS="PASS (frontend-custom yarn build)"
+      build_output="$(cat /tmp/alfastack-daily-frontend-build.log)"
+    else
+      GATE_FAILED=true
+      BUILD_RESULTS="FAIL (frontend-custom yarn build)"
+      build_output="$(cat /tmp/alfastack-daily-frontend-build.log)"
+    fi
   else
     GATE_FAILED=true
-    BUILD_RESULTS="FAIL (frontend-custom yarn build)"
-    build_output="$(cat /tmp/alfastack-daily-frontend-build.log)"
+    BUILD_RESULTS="FAIL (frontend-custom dependency refresh)"
+    build_output="$(cat /tmp/alfastack-daily-frontend-install.log)"
   fi
 fi
 

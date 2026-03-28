@@ -31,8 +31,10 @@ backend/app/core/telemetry.py
 backend/app/data_sources/clients/mariadb_client.py
 backend/app/routes/bow_settings.py
 backend/app/routes/mcp.py
+backend/app/ee/scim/constants.py
 backend/app/schemas/data_sources/configs.py
 backend/app/services/git_service.py
+backend/app/services/notification_service.py
 backend/app/services/organization_service.py
 backend/app/settings/bow_config.py
 backend/app/settings/brand_config.py
