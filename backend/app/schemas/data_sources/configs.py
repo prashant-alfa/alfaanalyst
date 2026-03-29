@@ -145,20 +145,15 @@ class BigQueryConfig(BaseModel):
 
 # NetSuite - all auth related fields should be in credentials
 class NetSuiteCredentials(BaseModel):
-    account_id: str = Field(..., title="Account ID", description="", json_schema_extra={"ui:type": "string"})
     consumer_key: str = Field(..., title="Consumer Key", description="", json_schema_extra={"ui:type": "string"})
     consumer_secret: str = Field(..., title="Consumer Secret", description="", json_schema_extra={"ui:type": "password"})
     token_id: str = Field(..., title="Token ID", description="", json_schema_extra={"ui:type": "string"})
     token_secret: str = Field(..., title="Token Secret", description="", json_schema_extra={"ui:type": "password"})
+    account_id: str = Field(..., title="Account ID", description="", json_schema_extra={"ui:type": "string"})
 
 
 class NetSuiteConfig(BaseModel):
-    table_filter: Optional[str] = Field(
-        None,
-        title="Table Filter",
-        description="Optional comma-separated list of table names to include in schema discovery. If empty, discovers all tables.",
-        json_schema_extra={"ui:type": "textarea"}
-    )
+    pass
 
 
 # Clickhouse
@@ -230,18 +225,6 @@ class MssqlConfig(SQLConfig):
         title="Schema",
         description="Optional schema or comma-separated list of schemas",
         json_schema_extra={"ui:type": "string"}
-    )
-    odbc_driver: int = Field(
-        18,
-        title="ODBC Driver Version",
-        description="ODBC driver version (17 or 18). Use 17 for SQL Server 2008 compatibility",
-        json_schema_extra={"ui:type": "select", "ui:options": [17, 18]}
-    )
-    encrypt: bool = Field(
-        True,
-        title="Encrypt Connection",
-        description="Encrypt the connection. Disable for SQL Server 2008 without TLS support",
-        json_schema_extra={"ui:type": "boolean"}
     )
 
 
@@ -670,120 +653,6 @@ class TimbrConfig(BaseModel):
     )
 
 
-# Sisense
-class SisenseCredentials(BaseModel):
-    username: str = Field(
-        "",
-        title="Username",
-        description="Sisense username (email). Leave blank if using API token.",
-        json_schema_extra={"ui:type": "string"}
-    )
-    password: str = Field(
-        "",
-        title="Password",
-        description="Sisense password. Leave blank if using API token.",
-        json_schema_extra={"ui:type": "password"}
-    )
-    api_token: str = Field(
-        "",
-        title="API Token",
-        description="Pre-existing Sisense API bearer token. If provided, username/password are ignored.",
-        json_schema_extra={"ui:type": "password"}
-    )
-
-    @model_validator(mode="after")
-    def validate_auth(cls, model: "SisenseCredentials") -> "SisenseCredentials":
-        has_userpass = model.username and model.password
-        has_token = bool(model.api_token)
-        if not has_userpass and not has_token:
-            raise ValueError("Either username/password or api_token must be provided.")
-        return model
-
-
-class SisenseConfig(BaseModel):
-    host: str = Field(
-        ...,
-        title="Host",
-        description="Sisense server URL (e.g., https://sisense.company.com)",
-        json_schema_extra={"ui:type": "string"}
-    )
-
-
-# MCP Server
-class MCPConfig(BaseModel):
-    server_url: str = Field(
-        ...,
-        title="Server URL",
-        description="URL of the MCP server (e.g., http://localhost:3000/mcp)",
-        json_schema_extra={"ui:type": "string"}
-    )
-    transport: str = Field(
-        "sse",
-        title="Transport",
-        description="MCP transport protocol",
-        json_schema_extra={"ui:type": "select", "options": ["sse", "streamable_http"]}
-    )
-
-
-class MCPNoAuthCredentials(BaseModel):
-    class Config:
-        extra = "allow"
-
-
-class MCPBearerCredentials(BaseModel):
-    token: str = Field(
-        ...,
-        title="Bearer Token",
-        description="Bearer token for authenticating with the MCP server",
-        json_schema_extra={"ui:type": "password"}
-    )
-
-
-# Custom API
-class CustomAPIConfig(BaseModel):
-    base_url: str = Field(
-        ...,
-        title="Base URL",
-        description="Base URL for the API (e.g., https://api.example.com/v1)",
-        json_schema_extra={"ui:type": "string"}
-    )
-    endpoints: list = Field(
-        default=[],
-        title="Endpoints",
-        description="List of API endpoint definitions",
-        json_schema_extra={"ui:type": "json"}
-    )
-
-
-class CustomAPINoAuthCredentials(BaseModel):
-    class Config:
-        extra = "allow"
-
-
-class CustomAPIBearerCredentials(BaseModel):
-    token: str = Field(
-        ...,
-        title="Bearer Token",
-        description="Bearer token for API authentication",
-        json_schema_extra={"ui:type": "password"}
-    )
-
-
-class CustomAPIKeyCredentials(BaseModel):
-    api_key: str = Field(
-        ...,
-        title="API Key",
-        description="API key for authentication",
-        json_schema_extra={"ui:type": "password"}
-    )
-    api_key_header: str = Field(
-        "X-API-Key",
-        title="API Key Header",
-        description="Header name for the API key",
-        json_schema_extra={"ui:type": "string"}
-    )
-
-
 __all__ = [
     # Configs
     "PostgreSQLConfig",
@@ -851,16 +720,4 @@ __all__ = [
     # Timbr
     "TimbrTokenCredentials",
     "TimbrConfig",
-    # Sisense
-    "SisenseCredentials",
-    "SisenseConfig",
-    # MCP
-    "MCPConfig",
-    "MCPNoAuthCredentials",
-    "MCPBearerCredentials",
-    # Custom API
-    "CustomAPIConfig",
-    "CustomAPINoAuthCredentials",
-    "CustomAPIBearerCredentials",
-    "CustomAPIKeyCredentials",
 ]

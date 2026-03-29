@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Mapping, Optional
@@ -14,28 +15,78 @@ try:
 except Exception:  # pragma: no cover - safe import guard
     Posthog = None  # type: ignore
 
-# Hardcoded PostHog credentials per user request
-POSTHOG_API_KEY = "phc_aWBVqSFPK846NT5XRUm9NmiiX0ElKNDJwA97lZ3DfGq"
-POSTHOG_HOST = "https://us.i.posthog.com"
-
-# Thread pool for running blocking PostHog calls without blocking the event loop
+_DEFAULT_POSTHOG_HOST = "https://us.i.posthog.com"
 _telemetry_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="telemetry")
 
 
-def _init_posthog_client():
-    """Initialize a singleton PostHog client using hardcoded key/host."""
-    api_key = POSTHOG_API_KEY
-    host = POSTHOG_HOST
-    if not api_key or Posthog is None:
+def _parse_bool(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _resolve_runtime_config() -> dict:
+    telemetry_cfg = getattr(settings.bow_config, "telemetry", None)
+    enabled = bool(getattr(telemetry_cfg, "enabled", False))
+    provider = str(getattr(telemetry_cfg, "provider", "posthog") or "posthog").strip().lower()
+    host = str(getattr(telemetry_cfg, "host", _DEFAULT_POSTHOG_HOST) or _DEFAULT_POSTHOG_HOST).strip()
+    api_key = getattr(telemetry_cfg, "posthog_api_key", None)
+
+    env_enabled = _parse_bool(os.getenv("BOW_TELEMETRY_ENABLED"))
+    if env_enabled is not None:
+        enabled = env_enabled
+
+    env_provider = os.getenv("BOW_TELEMETRY_PROVIDER")
+    if env_provider:
+        provider = env_provider.strip().lower()
+
+    env_host = os.getenv("BOW_POSTHOG_HOST")
+    if env_host:
+        host = env_host.strip()
+
+    env_api_key = os.getenv("BOW_POSTHOG_API_KEY")
+    if env_api_key is not None:
+        api_key = env_api_key.strip() or None
+
+    if settings.TESTING:
+        enabled = False
+
+    if enabled and provider != "posthog":
+        logger.warning("Telemetry provider '%s' is not supported. Disabling telemetry.", provider)
+        enabled = False
+
+    if enabled and not api_key:
+        logger.warning("Telemetry is enabled but BOW_POSTHOG_API_KEY is missing. Disabling telemetry.")
+        enabled = False
+
+    return {
+        "enabled": enabled,
+        "provider": provider,
+        "host": host or _DEFAULT_POSTHOG_HOST,
+        "api_key": api_key,
+    }
+
+
+def _init_posthog_client(runtime: dict):
+    if not runtime["enabled"]:
+        return None
+    if Posthog is None:
+        logger.warning("Telemetry is enabled but posthog package is unavailable. Disabling telemetry.")
         return None
     try:
-        return Posthog(api_key, host=host)
+        return Posthog(runtime["api_key"], host=runtime["host"])
     except Exception:
         logger.exception("Failed to initialize PostHog client")
         return None
 
 
-_posthog = _init_posthog_client()
+_telemetry_runtime = _resolve_runtime_config()
+_posthog = _init_posthog_client(_telemetry_runtime)
 
 
 def _do_capture(
@@ -45,7 +96,6 @@ def _do_capture(
     timestamp: Optional[datetime],
     groups: Optional[dict],
 ) -> None:
-    """Blocking PostHog capture - runs in thread pool."""
     try:
         _posthog.capture(
             distinct_id=distinct_id,
@@ -59,7 +109,6 @@ def _do_capture(
 
 
 def _do_identify(distinct_id: str, properties: dict) -> None:
-    """Blocking PostHog identify - runs in thread pool."""
     try:
         _posthog.identify(distinct_id=distinct_id, properties=properties)
     except Exception:
@@ -67,21 +116,11 @@ def _do_identify(distinct_id: str, properties: dict) -> None:
 
 
 class Telemetry:
-    """Minimal server-side telemetry helper backed by PostHog.
-
-    All calls are fire-and-forget background tasks that never block.
-    If disabled, methods are no-ops. Errors never surface to callers.
-    """
+    """Minimal server-side telemetry helper backed by PostHog."""
 
     @staticmethod
     def _enabled() -> bool:
-        try:
-            # Disable telemetry in test mode
-            if settings.TESTING:
-                return False
-            return bool(getattr(settings.bow_config, "telemetry", None) and settings.bow_config.telemetry.enabled)
-        except Exception:
-            return False
+        return bool(_telemetry_runtime["enabled"] and _posthog is not None)
 
     @classmethod
     async def capture(
@@ -92,8 +131,7 @@ class Telemetry:
         org_id: Optional[str] = None,
         occurred_at: Optional[datetime] = None,
     ) -> None:
-        """Fire-and-forget telemetry capture. Never blocks the caller."""
-        if not (cls._enabled() and _posthog is not None):
+        if not cls._enabled():
             return
         try:
             props = dict(properties or {})
@@ -101,7 +139,6 @@ class Telemetry:
                 props["org_id"] = str(org_id)
 
             loop = asyncio.get_running_loop()
-            # Submit to thread pool and don't await - fire and forget
             loop.run_in_executor(
                 _telemetry_executor,
                 _do_capture,
@@ -120,12 +157,10 @@ class Telemetry:
         user_id: str,
         traits: Optional[Mapping[str, Any]] = None,
     ) -> None:
-        """Fire-and-forget telemetry identify. Never blocks the caller."""
-        if not (cls._enabled() and _posthog is not None):
+        if not cls._enabled():
             return
         try:
             loop = asyncio.get_running_loop()
-            # Submit to thread pool and don't await - fire and forget
             loop.run_in_executor(
                 _telemetry_executor,
                 _do_identify,
@@ -136,5 +171,4 @@ class Telemetry:
             logger.exception("telemetry.identify failed")
 
 
-# Convenience alias for imports: from app.core.telemetry import telemetry
 telemetry = Telemetry
