@@ -1,5 +1,6 @@
 from typing import List, Optional
-from pydantic import BaseModel, Field, validator
+from pydantic import AliasGenerator, BaseModel, ConfigDict, Field, validator
+from pydantic.alias_generators import to_camel
 import os
 import secrets
 import base64
@@ -36,6 +37,32 @@ class FeatureFlags(BaseModel):
     allow_uninvited_signups: bool = False
     allow_multiple_organizations: bool = False
     verify_emails: bool = False
+
+
+class OTELConfig(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=AliasGenerator(
+            validation_alias=to_camel,
+            serialization_alias=to_camel,
+        )
+    )
+
+    enabled: bool = False
+    service_name: str = "alfa-analyst-backend"
+    traces_endpoint: str = "http://localhost:4317"
+    protocol: str = "grpc"
+    headers: Optional[str] = ""
+
+    def get_headers(self) -> dict:
+        if not self.headers:
+            return {}
+
+        headers = {}
+        for pair in self.headers.split(","):
+            if "=" in pair:
+                key, value = pair.split("=", 1)
+                headers[key.strip()] = value.strip()
+        return headers
 
 
 class AuthConfig(BaseModel):
@@ -135,6 +162,7 @@ class BowConfig(BaseModel):
     intercom: Intercom = Intercom()
     telemetry: Telemetry = Telemetry()
     license: LicenseConfig = LicenseConfig()
+    otel: OTELConfig = OTELConfig()
 
     @validator('encryption_key')
     def validate_encryption_key(cls, v):
