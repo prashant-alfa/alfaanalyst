@@ -1,0 +1,141 @@
+name: Alfastack Promote Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Branch/ref to promote to production"
+        required: true
+        type: string
+        default: "development"
+      force_sync_production:
+        description: "Force-reset production to source_ref (dangerous)"
+        type: boolean
+        default: false
+      run_docker_build_validation:
+        description: "Validate Dockerfile.alfa build before promotion"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    environment:
+      name: production-approval
+      url: https://analyst.alfastack.cloud
+    concurrency:
+      group: alfastack-production-promotion
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep jq
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch refs
+        run: |
+          git fetch origin main development production --prune
+
+      - name: Resolve source SHA
+        id: resolve_source
+        run: |
+          SOURCE_REF="${{ inputs.source_ref }}"
+          if git rev-parse --verify "origin/$SOURCE_REF" >/dev/null 2>&1; then
+            SOURCE_SHA="$(git rev-parse "origin/$SOURCE_REF")"
+          else
+            SOURCE_SHA="$(git rev-parse "$SOURCE_REF")"
+          fi
+          if [ -z "$SOURCE_SHA" ]; then
+            echo "Unable to resolve source_ref: $SOURCE_REF"
+            exit 1
+          fi
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Resolved source SHA: $SOURCE_SHA"
+
+      - name: Enforce source matches development head
+        run: |
+          SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
+          DEV_SHA="$(git rev-parse origin/development)"
+          if [ "$SOURCE_SHA" != "$DEV_SHA" ]; then
+            echo "Source SHA ($SOURCE_SHA) must match origin/development ($DEV_SHA)."
+            echo "Promote only tested development head."
+            exit 1
+          fi
+
+      - name: Verify Alfastack CI passed for source SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
+          RUNS_JSON="$(curl -sSf \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runs?head_sha=${SOURCE_SHA}&event=push&per_page=100")"
+
+          CI_SUCCESS_COUNT="$(echo "$RUNS_JSON" | jq --arg sha "$SOURCE_SHA" '[.workflow_runs[] | select(.name=="Alfastack CI" and .head_sha==$sha and .conclusion=="success")] | length')"
+          if [ "$CI_SUCCESS_COUNT" -lt 1 ]; then
+            echo "No successful Alfastack CI run found for source SHA: $SOURCE_SHA"
+            exit 1
+          fi
+
+      - name: Promote source to production (fast-forward)
+        id: promote_ff
+        if: inputs.force_sync_production == false
+        continue-on-error: true
+        run: |
+          SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
+          git checkout -B production origin/production
+          git merge --ff-only "$SOURCE_SHA"
+          git push origin production
+
+      - name: Promote source to production (force sync fallback)
+        if: inputs.force_sync_production == false && steps.promote_ff.outcome == 'failure'
+        run: |
+          SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
+          echo "Fast-forward promotion failed; forcing production to source SHA $SOURCE_SHA"
+          git reset --hard "$SOURCE_SHA"
+          git push origin production --force-with-lease
+
+      - name: Promote source to production (force sync)
+        if: inputs.force_sync_production == true
+        run: |
+          SOURCE_SHA="${{ steps.resolve_source.outputs.source_sha }}"
+          git branch -f production "$SOURCE_SHA"
+          git push origin production --force-with-lease
+
+      - name: White-label leak scan
+        run: ./scripts/branding/whitelabel_scan.sh
+
+      - name: Runtime safety checks
+        run: ./scripts/branding/runtime_safety_check.sh
+
+      - name: Generated files guard
+        run: ./scripts/branding/check_tracked_generated_files.sh
+
+      - name: Validate production docker build
+        if: inputs.run_docker_build_validation == true
+        run: |
+          docker build -f Dockerfile.alfa -t alfastack-production:${{ github.sha }} .
+
+      - name: Dispatch private sync workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sSf -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/alfastack-sync-to-private-production.yml/dispatches" \
+            -d '{"ref":"production","inputs":{"dispatch_private_deploy":"true"}}'

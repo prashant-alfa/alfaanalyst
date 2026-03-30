@@ -241,11 +241,12 @@ class OrganizationService:
     
     async def _send_invitation_email(self, membership: Membership, email: str):
         sign_up_url = settings.bow_config.base_url + "/users/sign-up?email=" + email
+        project_name = settings.PROJECT_NAME
 
         message = MessageSchema(
-            subject="You are invited to Bag of words",
+            subject=f"You are invited to {project_name}",
             recipients=[email],
-            body=f"You have been invited to join an organization on Bag of words. Click to sign up: <br /> {sign_up_url}",
+            body=f"You have been invited to join an organization on {project_name}. Click to sign up: <br /> {sign_up_url}",
             subtype="html")
         fm = settings.email_client
         logger.info(f"Using email client: {fm}")

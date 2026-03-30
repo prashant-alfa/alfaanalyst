@@ -14,6 +14,11 @@ from app.schemas.notification_schema import (
 logger = getLogger(__name__)
 
 
+def _brand_footer_label() -> str:
+    product_name = getattr(settings.brand_config, "product_name", None)
+    return f"Sent via {product_name or 'Alfa Analyst'}"
+
+
 class NotificationService:
 
     # ---- public dispatcher ----
@@ -212,7 +217,7 @@ class NotificationService:
           </tr>
           <tr>
             <td style="padding:16px 40px; border-top:1px solid #e5e7eb;">
-              <p style="margin:0; font-size:12px; color:#9ca3af;">Sent via Bag of Words</p>
+              <p style="margin:0; font-size:12px; color:#9ca3af;">{_brand_footer_label()}</p>
             </td>
           </tr>
         </table>
@@ -340,7 +345,7 @@ class NotificationService:
           </tr>
           <tr>
             <td style="padding:16px 40px; border-top:1px solid #e5e7eb;">
-              <p style="margin:0; font-size:12px; color:#9ca3af;">Sent via Bag of Words</p>
+              <p style="margin:0; font-size:12px; color:#9ca3af;">{_brand_footer_label()}</p>
             </td>
           </tr>
         </table>
