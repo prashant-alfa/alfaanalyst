@@ -1,0 +1,44 @@
+name: Alfastack White-Label Gates
+
+on:
+  push:
+    branches: [main, development, production]
+  pull_request:
+    branches: [development, production]
+
+jobs:
+  white-label-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Run white-label leak scan
+        run: ./scripts/branding/whitelabel_scan.sh
+
+      - name: Run runtime safety checks
+        run: ./scripts/branding/runtime_safety_check.sh
+
+      - name: Enforce no tracked generated files
+        run: ./scripts/branding/check_tracked_generated_files.sh
+
+  production-promotion-gate:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/production'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify production equals development head
+        run: |
+          git fetch origin development
+          DEV_SHA="$(git rev-parse origin/development)"
+          if [ "$GITHUB_SHA" != "$DEV_SHA" ]; then
+            echo "Production SHA ($GITHUB_SHA) does not match development SHA ($DEV_SHA)."
+            exit 1
+          fi

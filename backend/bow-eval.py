@@ -10,8 +10,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class APIClient:
-    def __init__(self, base_url="http://localhost:8000"):
-        self.base_url = base_url
+    def __init__(self, base_url=None):
+        self.base_url = base_url or os.getenv("BOW_API_URL", "http://localhost:8000")
         self.token = None
         self.org_id = None
 

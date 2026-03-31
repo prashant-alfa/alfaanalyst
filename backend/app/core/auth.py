@@ -255,13 +255,14 @@ class UserManager(BaseUserManager[User, str]):
         import asyncio
         
         base_url = settings.bow_config.base_url
+        project_name = settings.PROJECT_NAME
             
         reset_url = f"{base_url}/users/reset-password?token={token}"
         
         message = MessageSchema(
             subject="Reset your password",
             recipients=[user.email],
-            body=f"Hello {user.name},<br /><br />You have requested to reset your password for Bag of words. Click the link below to reset your password:<br /><br /> <a href='{reset_url}'>{reset_url}</a><br /><br />If you didn't request this, please ignore this email.<br /><br />Best regards,<br />Bag of words team",
+            body=f"Hello {user.name},<br /><br />You have requested to reset your password for {project_name}. Click the link below to reset your password:<br /><br /> <a href='{reset_url}'>{reset_url}</a><br /><br />If you didn't request this, please ignore this email.<br /><br />Best regards,<br />{project_name} team",
             subtype="html"
         )
         fm = settings.email_client
@@ -284,13 +285,14 @@ class UserManager(BaseUserManager[User, str]):
         import asyncio
         
         base_url = settings.bow_config.base_url
+        project_name = settings.PROJECT_NAME
             
         verification_url = f"{base_url}/users/verify?token={token}"
         
         message = MessageSchema(
             subject="Verify your email",
             recipients=[user.email],
-            body=f"Welcome to Bag of words! You are almost ready to start using our platform. Click to verify your email: <br /> {verification_url}",
+            body=f"Welcome to {project_name}! You are almost ready to start using our platform. Click to verify your email: <br /> {verification_url}",
             subtype="html"
         )
         fm = settings.email_client
@@ -422,16 +424,3 @@ async def current_user(
         detail="Not authenticated",
         headers={"WWW-Authenticate": "Bearer"},
     )
-
-
-async def current_user_optional(
-    request: Request,
-    jwt_user: Optional[User] = Depends(_jwt_current_user),
-    api_key: Optional[str] = Depends(api_key_header),
-    db: AsyncSession = Depends(get_async_db),
-) -> Optional[User]:
-    """Same as current_user but returns None instead of raising 401."""
-    try:
-        return await current_user(request, jwt_user, api_key, db)
-    except HTTPException:
-        return None
