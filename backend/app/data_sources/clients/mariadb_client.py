@@ -12,16 +12,17 @@ from urllib.parse import quote_plus
 
 
 class MariadbClient(DataSourceClient):
-    def __init__(self, host, port, database, user, password):
+    # [FIX 1] Updated __init__ to accept 'ssl'
+    def __init__(self, host, port, database, user, password, ssl=False):
         self.host = host
         self.port = port
         self.database = database
         self.user = user
         self.password = password
+        self.ssl = ssl
 
     @cached_property
     def mariadb_uri(self):
-        # Updated URI to use pymysql
         auth_part = ""
         if self.user:
             auth_part = quote_plus(self.user)
@@ -41,7 +42,12 @@ class MariadbClient(DataSourceClient):
         engine = None
         conn = None
         try:
-            engine = sqlalchemy.create_engine(self.mariadb_uri)
+            # [FIX 2] Pass SSL args to engine
+            connect_args = {}
+            if self.ssl:
+                connect_args["ssl"] = {"ssl_mode": "REQUIRED"}
+
+            engine = sqlalchemy.create_engine(self.mariadb_uri, connect_args=connect_args)
             conn = engine.connect()
 
             yield conn
@@ -53,8 +59,19 @@ class MariadbClient(DataSourceClient):
             if engine is not None:
                 engine.dispose()
 
+    # [FIX 3] Ensure cursor method is present (from previous fix)
+    @contextmanager
+    def cursor(self):
+        """Yield a raw DB-API cursor."""
+        with self.connect() as conn:
+            raw_conn = conn.connection
+            cursor = raw_conn.cursor()
+            try:
+                yield cursor
+            finally:
+                cursor.close()
+
     def execute_query(self, sql: str) -> pd.DataFrame:
-        """Execute SQL statement and return the result as a DataFrame."""
         try:
             with self.connect() as conn:
                 df = pd.read_sql(text(sql), conn)
@@ -64,7 +81,6 @@ class MariadbClient(DataSourceClient):
             raise
 
     def get_tables(self) -> List[Table]:
-        """Get all tables and their columns in the specified database."""
         try:
             with self.connect() as conn:
                 sql = """
@@ -91,12 +107,10 @@ class MariadbClient(DataSourceClient):
             return []
 
     def get_schema(self, table_id: str) -> Table:
-        """Placeholder implementation for the abstract method."""
         raise NotImplementedError(
             "get_schema() is not implemented in MariadbClient. Use get_tables() instead.")
 
     def get_schemas(self):
-        """Get schemas for all tables in the specified database."""
         return self.get_tables()
 
     def prompt_schema(self):
@@ -104,7 +118,6 @@ class MariadbClient(DataSourceClient):
         return TableFormatter(schemas).table_str
 
     def test_connection(self):
-        """Test connection to MariaDB and return status information."""
         try:
             with self.connect() as conn:
                 conn.execute(text("SELECT 1"))
@@ -120,5 +133,4 @@ class MariadbClient(DataSourceClient):
 
     @property
     def description(self):
-        description = f"MariaDB client (using pymysql) for database '{self.database}' at {self.host}:{self.port}"
-        return description
+        return f"MariaDB client (using pymysql) for database '{self.database}' at {self.host}:{self.port}"

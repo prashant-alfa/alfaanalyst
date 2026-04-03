@@ -6,6 +6,8 @@
 
 ## The open-source agentic analytics platform
 
+<!-- CI/CD smoke test: README change on development triggers pipeline -->
+
 
 
 Chat, visualize, and run deep analysis on your data - with memory, rules management, and observability built in.
@@ -121,7 +123,6 @@ Below is a list of all data sources supported by Bag of words, as defined in the
 | Snowflake                | Database/Warehouse  |
 | Google BigQuery          | Database/Warehouse  |
 | Databricks SQL           | Database/Warehouse  |
-| Microsoft Fabric         | Database/Warehouse  |
 | NetSuite                 | Service             |
 | MySQL                    | Database/Warehouse  |
 | AWS Athena               | Database/Warehouse  |
@@ -140,10 +141,6 @@ Below is a list of all data sources supported by Bag of words, as defined in the
 | Oracle DB                | Database/Warehouse  |
 | MongoDB                  | Database/Warehouse  |
 | PostHog                  | Service             |
-| PowerBI                  | Service             |
-| QlikView                 | Service             |
-| Sybase SQL Anywhere      | Database/Warehouse  |
-| Sisense BI               | Service             |
 
 > **Note:** Some data sources (like NetSuite) may be marked as inactive or beta in the registry. "Service" refers to APIs or SaaS platforms, while "Database/Warehouse" refers to systems that store and query structured data.
 
@@ -174,4 +171,3 @@ You can also disable the Intercom chat for support
 intercom
   enabled: false
 ```
-

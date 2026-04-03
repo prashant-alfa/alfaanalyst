@@ -7,3 +7,5 @@ Key components:
 2. [Data Sources](/documents/data_sources.md): Integrating third-party data sources, databases, services, and files
 3. [Language Models](/documents/language_models.md): Integrating LLM providers and models
 4. [Installation](/documents/installation.md): Deploying Bag of words SaaS
+5. [Alfastack White-Label Ops](/documents/alfastack-whitelabel-ops.md): Upstream sync, branding gates, CI/CD runbook
+6. [Private Production Repo Setup](/documents/alfaanalyst-production-repo-setup.md): Split-repo deployment model and setup
