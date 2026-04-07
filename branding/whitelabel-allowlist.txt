@@ -1,0 +1,19 @@
+# Regex patterns. Matched against "path:line:content".
+# Keep this list as small as possible.
+
+# Internal technical identifiers that are not customer-visible UI copy
+(^|.*/)backend/app/data_sources/clients/aws_redshift_client\.py:
+(^|.*/)backend/app/models/llm_provider\.py:
+
+# Legacy API examples/documentation not shipped in product UI
+(^|.*/)backend/app/routes/git\.py:
+(^|.*/)backend/app/routes/build\.py:
+(^|.*/)backend/tests/
+(^|.*/)README\.md:
+(^|.*/)documents/
+
+# Upstream enterprise legal/licensing sources (non-UI legal text / issuer checks)
+(^|.*/)backend/app/ee/LICENSE:
+(^|.*/)backend/app/ee/__init__\.py:
+(^|.*/)backend/app/ee/license\.py:
+(^|.*/)frontend-custom/ee/LICENSE:
