@@ -1,0 +1,118 @@
+name: Alfastack CI
+
+on:
+  push:
+    branches: [development, production]
+  pull_request:
+    branches: [development, production]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alfastack-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  white-label-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: White-label scan
+        run: ./scripts/branding/whitelabel_scan.sh
+
+      - name: Runtime safety checks
+        run: ./scripts/branding/runtime_safety_check.sh
+
+      - name: Generated files guard
+        run: ./scripts/branding/check_tracked_generated_files.sh
+
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_versioned.txt
+
+      - name: Run targeted backend tests
+        working-directory: ./backend
+        env:
+          TESTING: "true"
+          ENVIRONMENT: "production"
+          # bow-config.yaml uses ${BOW_SMTP_PORT}; tests don't need real SMTP but config must parse.
+          BOW_SMTP_PORT: "587"
+        run: |
+          set -o pipefail
+          # GitHub Actions runs bash with `-e` by default; temporarily disable so we can capture output.
+          set +e
+          pytest -q tests/e2e/test_mcp.py 2>&1 | tee /tmp/pytest-output.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            # Surface useful failure context without requiring Actions log access.
+            filtered="$(grep -E '^(E   |ERROR |FAILED|ImportError|Traceback|ModuleNotFoundError|pydantic_core\\._pydantic_core\\.ValidationError)' /tmp/pytest-output.txt | tail -n 60 || true)"
+            if [ -z "$filtered" ]; then
+              filtered="$(tail -n 60 /tmp/pytest-output.txt)"
+            fi
+            msg="$(printf '%s\n' "$filtered" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::error::$msg"
+            exit "$status"
+          fi
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync
+
+      - name: Rebuild frontend-custom from overlay
+        run: ./scripts/branding/rebuild_frontend_custom.sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "yarn"
+          cache-dependency-path: frontend-custom/yarn.lock
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend-custom
+        run: |
+          npm install --global yarn@1.22.22
+          yarn install --frozen-lockfile
+
+      - name: Build frontend-custom
+        working-directory: ./frontend-custom
+        run: |
+          yarn build
+
+  docker-validate:
+    if: github.event_name == 'push'
+    needs: [white-label-gates, backend-tests, frontend-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Dockerfile.alfa
+        run: |
+          docker build -f Dockerfile.alfa -t alfastack-ci:${{ github.sha }} .

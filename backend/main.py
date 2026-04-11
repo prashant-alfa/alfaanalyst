@@ -34,7 +34,6 @@ from app.core.cors import init_cors
 from app.core.scheduler import scheduler
 from app.models.user import User
 from app.services.maintenance_service import purge_step_payloads_keep_latest_per_query
-from app.core.otel import setup_telemetry, instrument_app
 
 from app.routes import (
     report,
@@ -61,7 +60,6 @@ from app.routes import (
     external_user_mapping,
     slack_webhook,
     teams_webhook,
-    whatsapp_webhook,
     step,
     instruction,
     onboarding,
@@ -75,32 +73,24 @@ from app.routes import (
     build,
     connection,
     artifact,
-    oauth_server,
-    rbac,
-    scheduled_prompt,
 )
 from app.routes.oidc_auth import router as oidc_auth_router
 from app.ee.routes import router as enterprise_router
-from app.ee.license import get_license_info, has_feature
+from app.ee.license import get_license_info
 
 # Initialize logging
 loggers = setup_logging()
 logger = get_logger(__name__)
-# Initialize OpenTelemetry if enabled (before app creation)
-setup_telemetry(settings.bow_config.otel)
+
 # Read configuration
 enable_google_oauth = settings.bow_config.google_oauth.enabled
 google_client_id = settings.bow_config.google_oauth.client_id
 google_client_secret = settings.bow_config.google_oauth.client_secret
 
 # Initialize FastAPI app
-swagger_enabled = settings.bow_config.swagger.enabled
 app = FastAPI(
-    title=settings.PROJECT_NAME,
+    title=settings.PROJECT_NAME, 
     debug=settings.DEBUG,
-    docs_url="/swagger" if swagger_enabled else None,
-    redoc_url=None,
-    openapi_url="/openapi.json" if swagger_enabled else None,
     openapi_tags=[
         {"name": "auth", "description": "Authentication operations"},
         {"name": "reports", "description": "Report management"},
@@ -118,8 +108,6 @@ app = FastAPI(
     swagger_ui_oauth2_redirect_url="/api/auth/jwt/login"
 )
 
-# Instrument FastAPI with OpenTelemetry
-instrument_app(app, settings.bow_config.otel)
 init_cors(app)
 
 oauth_providers = []
@@ -181,7 +169,6 @@ app.include_router(
 app.include_router(demo_data_source.router, prefix="/api")  # Must be before data_source for /data_sources/demos to match
 app.include_router(data_source.router, prefix="/api")
 app.include_router(report.router, prefix="/api")
-app.include_router(scheduled_prompt.router, prefix="/api")
 app.include_router(test.router, prefix="/api")
 app.include_router(widget.router, prefix="/api")
 app.include_router(query.router, prefix="/api")
@@ -191,7 +178,6 @@ app.include_router(completion.router)
 app.include_router(completion_feedback.router, prefix="/api")
 app.include_router(file.router, prefix="/api")
 app.include_router(organization.router, prefix="/api")
-app.include_router(rbac.router, prefix="/api")
 app.include_router(text_widget.router, prefix="/api")
 app.include_router(llm.router, prefix="/api")
 app.include_router(git.router, prefix="/api")
@@ -203,7 +189,6 @@ app.include_router(external_platform.router, prefix="/api")
 app.include_router(external_user_mapping.router, prefix="/api")
 app.include_router(slack_webhook.router)
 app.include_router(teams_webhook.router)
-app.include_router(whatsapp_webhook.router)
 app.include_router(step.router, prefix="/api")
 app.include_router(instruction.router, prefix="/api")
 app.include_router(build.router, prefix="/api")
@@ -214,15 +199,9 @@ app.include_router(user_data_source_credentials.router, prefix="/api")
 app.include_router(mentions.router, prefix="/api")
 app.include_router(api_key.router, prefix="/api")
 app.include_router(mcp.router, prefix="/api")
-app.include_router(oauth_server.well_known_router)  # /.well-known/* at root
-app.include_router(oauth_server.router, prefix="/api")  # /api/oauth/*
 app.include_router(connection.router, prefix="/api")
 app.include_router(artifact.router, prefix="/api")
 app.include_router(enterprise_router, prefix="/api")
-
-# SCIM 2.0 provisioning endpoints (mounted at /scim/v2, not under /api)
-from app.ee.scim.routes import scim_router
-app.include_router(scim_router)
 
 # Remove the direct assignment of app.openapi_schema and replace with this function
 def custom_openapi():
@@ -232,7 +211,7 @@ def custom_openapi():
     openapi_schema = get_openapi(
         title=settings.PROJECT_NAME,
         version=settings.PROJECT_VERSION,
-        description="Bag of Words API",
+        description=f"{settings.PROJECT_NAME} API",
         routes=app.routes,
     )
 
@@ -335,29 +314,7 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to schedule purge job: {e}")
 
-    # Register LDAP group sync job if configured AND licensed (sync is enterprise-only)
-    if settings.bow_config.ldap.enabled and has_feature("ldap"):
-        try:
-            from app.ee.ldap.jobs import ldap_sync_all_organizations
-            scheduler.add_job(
-                ldap_sync_all_organizations,
-                trigger="interval",
-                minutes=settings.bow_config.ldap.sync_interval_minutes,
-                id="ldap_group_sync",
-                replace_existing=True,
-                coalesce=True,
-                max_instances=1,
-                misfire_grace_time=300,
-            )
-            logger.info(f"Scheduled job: ldap_group_sync every {settings.bow_config.ldap.sync_interval_minutes}m")
-        except Exception as e:
-            logger.error(f"Failed to schedule LDAP sync job: {e}")
-
     scheduler.start()
-
-    # Re-register scheduled prompt jobs
-    from app.services.scheduled_prompt_service import scheduled_prompt_service
-    await scheduled_prompt_service.register_all_jobs()
 
     # Validate license at startup
     license_info = get_license_info()
@@ -393,7 +350,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=int(os.getenv("PORT", 8000)),
         reload=True,
         workers=20
     )
