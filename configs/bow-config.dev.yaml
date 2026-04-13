@@ -9,8 +9,8 @@ database:
   url: ${BOW_DATABASE_URL}
   
 features:
-  allow_uninvited_signups: false
-  allow_multiple_organizations: false
+  allow_uninvited_signups: true
+  allow_multiple_organizations: true
   verify_emails: false
 
 auth:
@@ -36,13 +36,6 @@ oidc_providers:
  # redirect_path: /api/auth/okta/callback
  # extra_authorize_params: { prompt: login }
  # extra_token_params: {}
-
-# ldap:
-#  enabled: true
-#  url: ldaps://ad.company.com:636
-#  bind_dn: cn=service-account,ou=Services,dc=company,dc=com
-#  bind_password: ${BOW_LDAP_BIND_PASSWORD}
-
 encryption_key: ${BOW_ENCRYPTION_KEY}
 
 smtp_settings:
@@ -51,14 +44,15 @@ smtp_settings:
   username: "resend"
   password: ${BOW_SMTP_PASSWORD}
 
-swagger:
-  enabled: true
-
 intercom:
-  enabled: true
+  enabled: false
+  app_id: ${BOW_INTERCOM_APP_ID}
 
 telemetry:
   enabled: false
+  provider: "posthog"
+  host: ${BOW_POSTHOG_HOST}
+  posthog_api_key: ${BOW_POSTHOG_API_KEY}
 
 license:
   key: ${BOW_LICENSE_KEY}
