@@ -2,9 +2,15 @@
 # Licensed under the Business Source License 1.1
 # See ENTERPRISE_LICENSE for details
 
+from app.settings.brand_config import BrandConfig
+
+
+brand_config = BrandConfig.load()
+docs_url = (brand_config.docs_url or brand_config.primary_domain).rstrip("/")
+
 SERVICE_PROVIDER_CONFIG = {
     "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
-    "documentationUri": "https://docs.bagofwords.com/enterprise/scim",
+    "documentationUri": f"{docs_url}/enterprise/scim",
     "patch": {"supported": True},
     "bulk": {"supported": False, "maxOperations": 0, "maxPayloadSize": 0},
     "filter": {"supported": True, "maxResults": 100},
