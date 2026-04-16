@@ -1,0 +1,98 @@
+name: Alfastack Sync To Private Production Repo
+
+on:
+  push:
+    branches: [production]
+  workflow_dispatch:
+    inputs:
+      dispatch_private_deploy:
+        description: "Trigger deploy event in private production repo"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alfastack-sync-private-production
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare production ref
+        run: |
+          git fetch origin production --prune
+          git checkout -B production origin/production
+
+      - name: Validate required secrets
+        id: private_repo_config
+        env:
+          TARGET_OWNER: ${{ secrets.PRIVATE_PROD_REPO_OWNER }}
+          TARGET_REPO: ${{ secrets.PRIVATE_PROD_REPO_NAME }}
+          TARGET_PAT: ${{ secrets.PRIVATE_PROD_REPO_PAT }}
+        run: |
+          missing=()
+          [ -n "$TARGET_OWNER" ] || missing+=("PRIVATE_PROD_REPO_OWNER")
+          [ -n "$TARGET_REPO" ] || missing+=("PRIVATE_PROD_REPO_NAME")
+          [ -n "$TARGET_PAT" ] || missing+=("PRIVATE_PROD_REPO_PAT")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping optional public->private sync. Missing secrets: ${missing[*]}"
+            exit 0
+          fi
+
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror production branch to private repo
+        if: steps.private_repo_config.outputs.configured == 'true'
+        env:
+          TARGET_OWNER: ${{ secrets.PRIVATE_PROD_REPO_OWNER }}
+          TARGET_REPO: ${{ secrets.PRIVATE_PROD_REPO_NAME }}
+          TARGET_PAT: ${{ secrets.PRIVATE_PROD_REPO_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TARGET_URL="https://x-access-token:${TARGET_PAT}@github.com/${TARGET_OWNER}/${TARGET_REPO}.git"
+          git remote add private-production "$TARGET_URL" || git remote set-url private-production "$TARGET_URL"
+          git push private-production production:production --force
+          echo "Mirrored production -> ${TARGET_OWNER}/${TARGET_REPO}:production"
+
+      - name: Dispatch private deploy event
+        if: steps.private_repo_config.outputs.configured == 'true'
+        env:
+          TARGET_OWNER: ${{ secrets.PRIVATE_PROD_REPO_OWNER }}
+          TARGET_REPO: ${{ secrets.PRIVATE_PROD_REPO_NAME }}
+          TARGET_PAT: ${{ secrets.PRIVATE_PROD_REPO_PAT }}
+          EVENT_TYPE: ${{ secrets.PRIVATE_PROD_REPO_DEPLOY_EVENT }}
+          DISPATCH_PRIVATE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.dispatch_private_deploy || 'true' }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          if [ "$DISPATCH_PRIVATE_DEPLOY" != "true" ]; then
+            echo "Skipping private deploy dispatch by user input."
+            exit 0
+          fi
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          if [ -z "$EVENT_TYPE" ]; then
+            EVENT_TYPE="production-sync"
+          fi
+          curl -sSf -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $TARGET_PAT" \
+            "https://api.github.com/repos/${TARGET_OWNER}/${TARGET_REPO}/dispatches" \
+            -d @- <<EOF
+          {
+            "event_type": "${EVENT_TYPE}",
+            "client_payload": {
+              "source_repository": "${SOURCE_REPO}",
+              "source_sha": "${SOURCE_SHA}",
+              "source_branch": "production"
+            }
+          }
+          EOF

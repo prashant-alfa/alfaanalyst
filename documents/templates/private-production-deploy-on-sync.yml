@@ -1,0 +1,44 @@
+name: Deploy On Production Sync
+
+on:
+  repository_dispatch:
+    types: [production-sync]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production-approval
+      url: https://analyst.alfastack.cloud
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure production branch
+        run: |
+          git fetch origin production --prune
+          git checkout -B production origin/production
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_SSH_PORT || '22' }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "${{ secrets.PROD_APP_DIR }}"
+            git fetch origin --prune
+            git checkout production
+            git reset --hard origin/production
+            sudo -n docker compose build app
+            sudo -n docker compose up -d --remove-orphans
+            sudo -n docker compose ps
+
+      - name: Healthcheck
+        run: |
+          curl -fsS https://analyst.alfastack.cloud/api/settings >/dev/null
