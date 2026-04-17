@@ -1,72 +1,44 @@
 # Deployment Configuration
-base_url: http://0.0.0.0:3000 
+deployment:
+  type: "self_hosted"
 
+base_url: https://analyst.alfastack.cloud
 
-# Feature Flags
+database:
+  url: ${BOW_DATABASE_URL}
+
 features:
-  allow_uninvited_signups: false
-  allow_multiple_organizations: false 
-  verify_emails: false
-
+  allow_uninvited_signups: true
+  allow_multiple_organizations: true
+  verify_emails: true
 
 auth:
-  mode: "hybrid" # hybrid | local_only | sso_only
+  # Using local_only to skip Google OAuth setup for now
+  mode: "local_only" # hybrid | local_only | sso_only
 
 google_oauth:
   enabled: false
 
-# oidc_providers:
-#- name: okta
-#  enabled: false
-#  issuer: https://YOUR_OKTA_DOMAIN.okta.com/oauth2/default
-#  client_id: ${BOW_OKTA_CLIENT_ID}
-#  client_secret: ${BOW_OKTA_CLIENT_SECRET}
-#  scopes: ["openid", "profile", "email"]
-#  pkce: true
-#  client_auth_method: basic
-#  discovery: true
-#  uid_claim: sub
- # Optional overrides:
- # redirect_path: /api/auth/okta/callback
- # extra_authorize_params: { prompt: login }
- # extra_token_params: {}
-
-# LDAP / Active Directory
-# ldap:
-#   enabled: false
-#   url: ldaps://ad.company.com:636
-#   bind_dn: cn=service-account,ou=Services,dc=company,dc=com
-#   bind_password: ${BOW_LDAP_BIND_PASSWORD}
-#   base_dn: dc=company,dc=com
-#   user_search_base: ou=Users,dc=company,dc=com
-#   user_search_filter: "(objectClass=person)"
-#   user_email_attribute: mail
-#   group_search_base: ou=Groups,dc=company,dc=com
-#   group_search_filter: "(objectClass=group)"
-#   group_name_attribute: cn
-#   group_member_attribute: member       # "member" (AD) or "memberUid" (OpenLDAP)
-#   group_member_format: dn              # "dn" or "uid"
-#   sync_interval_minutes: 60
-#   auto_provision_users: false
+smtp_settings:
+  host: ${BOW_SMTP_HOST}
+  port: ${BOW_SMTP_PORT}
+  username: ${BOW_SMTP_USER}
+  password: ${BOW_SMTP_PASSWORD}
+  from_email: ${BOW_SMTP_FROM}
+  from_name: "Alfa Analyst"
+  use_tls: true
 
 encryption_key: ${BOW_ENCRYPTION_KEY}
 
 intercom:
-  enabled: true
+  enabled: false
+  app_id: ${BOW_INTERCOM_APP_ID}
 
 telemetry:
-  enabled: true
-
-swagger:
   enabled: false
-
-# OpenTelemetry
-otel:
-  enabled: false
-#  service_name: bagofwords-backend
-#  traces_endpoint: http://localhost:4317
-#  protocol: grpc  # grpc or http/protobuf
-#  headers: ""  # format: key1=value1,key2=value2
+  provider: ${BOW_TELEMETRY_PROVIDER}
+  host: ${BOW_POSTHOG_HOST}
+  posthog_api_key: ${BOW_POSTHOG_API_KEY}
 
 # license:
-#    key: ${BOW_LICENSE_KEY}
+#   key: ${BOW_LICENSE_KEY}

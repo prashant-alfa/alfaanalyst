@@ -1,0 +1,318 @@
+<template>
+    <div class="inline-block relative" ref="containerRef">
+        <UPopover :popper="{ strategy: 'absolute', placement: 'bottom-start', offset: [0,8] }">
+            <UTooltip :text="isCompactFinal ? dataTooltip : ''" :popper="{ strategy: 'fixed', placement: 'bottom-start' }">
+                <button
+                    class="inline-flex items-center text-gray-500 hover:text-gray-900 hover:bg-gray-50 rounded-md p-2 text-xs"
+                    :disabled="isLoading"
+                >
+                    <span v-if="isLoading" class="flex items-center">
+                        <Spinner class="w-4 h-4 text-gray-400 animate-spin" />
+                    </span>
+                    <span v-else-if="internalSelectedDataSources.length > 0" class="flex items-center">
+                        <template v-if="isCompactFinal">
+                            <!-- Compact: show only first icon -->
+                            <DataSourceIcon :type="internalSelectedDataSources[0].type" class="h-4" />
+                        </template>
+                        <template v-else>
+                            <!-- Non-compact: show stacked icons -->
+                            <div class="flex -space-x-1">
+                                <DataSourceIcon
+                                    v-for="ds in internalSelectedDataSources.slice(0, 3)"
+                                    :key="ds.id"
+                                    :type="ds.type"
+                                    class="h-4 ring-1 ring-white rounded flex-shrink-0"
+                                />
+                            </div>
+                            <span v-if="internalSelectedDataSources.length > 3" class="ml-1 text-[10px] text-gray-400">
+                                +{{ internalSelectedDataSources.length - 3 }}
+                            </span>
+                        </template>
+                    </span>
+                    <span v-else class="flex items-center">
+                        <Icon name="heroicons-circle-stack" class="h-4 w-4" />
+                    </span>
+                </button>
+            </UTooltip>
+            <template #panel>
+                <div class="p-2 text-xs max-h-64 overflow-y-auto w-[260px] rounded-xl">
+                    <div v-if="isLoading" class="flex items-center justify-center py-6 text-gray-500 space-x-2">
+                        <Spinner class="w-4 h-4 text-gray-400 animate-spin" />
+                        <span>Loading data sources…</span>
+                    </div>
+                    <template v-else>
+                        <div v-if="visibleDataSources.length === 0" class="text-center text-gray-500 py-4">
+                            No data sources found
+                        </div>
+                        <div
+                            v-else
+                            v-for="ds in visibleDataSources"
+                            :key="ds.id"
+                            class="px-2 py-1.5 rounded hover:bg-gray-50 cursor-pointer flex items-center justify-between"
+                            @click="() => { toggleDataSource(ds); }"
+                            @mouseenter="onDataSourceHover(ds.id, $event)"
+                            @mouseleave="onDataSourceHoverLeave()"
+                        >
+                            <div class="flex items-center">
+                                <DataSourceIcon :type="ds.type" class="h-4" />
+                                <span class="ml-2 text-[13px]">{{ ds.name }}</span>
+                            </div>
+                            <Icon v-if="isSelected(ds)" name="heroicons-check" class="w-4 h-4 text-blue-500" />
+                        </div>
+                    </template>
+                </div>
+            </template>
+        </UPopover>
+
+        <!-- Agent flyout component -->
+        <AgentFlyout
+            :agent-id="hoveredDataSourceId"
+            :visible="flyout.visible"
+            :position="flyout"
+            @mouseenter="onFlyoutEnter"
+            @mouseleave="onFlyoutLeave"
+        />
+    </div>
+
+</template>
+
+<script lang="ts" setup>
+import Spinner from '@/components/Spinner.vue'
+import AgentFlyout from '~/components/AgentFlyout.vue'
+import { usePermissions, usePermissionsLoaded, useResourcePermissions } from '~/composables/usePermissions'
+
+type DataSource = { id: string; name: string; type?: string }
+const internalSelectedDataSources = ref<DataSource[]>([])
+const dataSources = ref<DataSource[]>([])
+const isLoading = ref(true)
+const isOpen = ref(false)
+const containerRef = ref<HTMLElement | null>(null)
+const isCompact = ref(false)
+const isCompactFinal = computed(() => isCompact.value)
+
+// Hover flyout state
+const hoveredDataSourceId = ref<string | null>(null)
+const flyout = reactive({ visible: false, bottom: 0, left: 0 })
+let flyoutHideTimer: ReturnType<typeof setTimeout> | null = null
+
+const showFlyoutAtEvent = (evt: MouseEvent) => {
+    const el = evt.currentTarget as HTMLElement | null
+    if (!el) return
+
+    // Find the dropdown panel to align with it
+    const panel = el.closest('.rounded-xl') as HTMLElement | null
+    const panelRect = panel?.getBoundingClientRect()
+    const rect = el.getBoundingClientRect()
+
+    const flyoutWidth = 400
+    const gap = 8
+
+    // Position to the right of the dropdown panel
+    let left = (panelRect?.right ?? rect.right) + gap
+
+    // If not enough space on right, position to the left
+    if (left + flyoutWidth > window.innerWidth - 12) {
+        left = (panelRect?.left ?? rect.left) - flyoutWidth - gap
+    }
+
+    // Clamp left to viewport
+    left = Math.max(12, Math.min(left, window.innerWidth - flyoutWidth - 12))
+
+    // Align bottom of flyout with bottom of dropdown panel (use CSS bottom)
+    const panelBottom = panelRect?.bottom ?? rect.bottom
+    const bottom = window.innerHeight - panelBottom
+
+    flyout.left = left
+    flyout.bottom = Math.max(12, bottom) // Clamp to viewport
+    flyout.visible = true
+}
+
+const onDataSourceHover = (dataSourceId: string, evt: MouseEvent) => {
+    if (flyoutHideTimer) {
+        clearTimeout(flyoutHideTimer)
+        flyoutHideTimer = null
+    }
+    if (typeof window !== 'undefined') showFlyoutAtEvent(evt)
+    hoveredDataSourceId.value = dataSourceId
+}
+
+const onDataSourceHoverLeave = () => {
+    // Give the user time to move cursor from list → flyout
+    if (flyoutHideTimer) clearTimeout(flyoutHideTimer)
+    flyoutHideTimer = setTimeout(() => {
+        flyout.visible = false
+        hoveredDataSourceId.value = null
+    }, 120)
+}
+
+const onFlyoutEnter = () => {
+    if (flyoutHideTimer) {
+        clearTimeout(flyoutHideTimer)
+        flyoutHideTimer = null
+    }
+    flyout.visible = true
+}
+
+const onFlyoutLeave = () => {
+    onDataSourceHoverLeave()
+}
+
+const props = defineProps({
+    selectedDataSources: {
+        type: Array,
+        default: () => [],
+    },
+    reportId: {
+        type: String,
+        default: () => '',
+    },
+    // When set, only show data sources the user has this permission on
+    // (either org-wide or via a per-DS resource grant).
+    permission: {
+        type: String,
+        default: '',
+    }
+});
+
+
+const emit = defineEmits(['update:selectedDataSources']);
+
+// Optionally restrict visible data sources to those the user has `permission`
+// for. Uses the resource-grant tier directly (NOT the org-perm implication
+// tier) so that org-wide perms don't auto-grant the action on every DS the
+// user can access — the user must have an explicit per-DS grant. Org admins
+// (full_admin_access) still see everything.
+const orgPerms = usePermissions()
+const permsLoaded = usePermissionsLoaded()
+const resourcePerms = useResourcePermissions()
+const visibleDataSources = computed(() => {
+    if (!props.permission) return dataSources.value
+    if (!permsLoaded.value) return []
+    if (orgPerms.value.includes('full_admin_access')) return dataSources.value
+    return dataSources.value.filter((ds: any) => {
+        const key = `data_source:${ds.id}`
+        return resourcePerms.value[key]?.includes(props.permission) ?? false
+    })
+})
+
+async function getDataSources() {
+    try {
+        const response = await useMyFetch('/data_sources/active', {
+            method: 'GET',
+        })
+        dataSources.value = (response.data.value as any[]) || []
+        // Initialize selection from prop if provided, otherwise leave empty for parent to decide
+        if ((props.selectedDataSources as any[])?.length) {
+            // Align to the objects from the current dataSources list by id
+            const ids = new Set((props.selectedDataSources as any[]).map((x: any) => x.id))
+            internalSelectedDataSources.value = dataSources.value.filter((ds: any) => ids.has(ds.id))
+            handleSelectionChange()
+        } else if (!props.reportId) {
+            // Landing page (no report): default to ALL active data sources
+            // (filtered by `permission` if set).
+            internalSelectedDataSources.value = visibleDataSources.value
+            handleSelectionChange()
+        }
+    } finally {
+        isLoading.value = false
+    }
+}
+
+function handleSelectionChange() {
+    emit('update:selectedDataSources', internalSelectedDataSources.value);
+}
+
+function isSelected(option: any) {
+    return internalSelectedDataSources.value.some((ds: any) => ds.id === option.id)
+}
+
+function toggleDataSource(ds: DataSource) {
+    const exists = internalSelectedDataSources.value.find((x) => x.id === ds.id)
+    if (exists) {
+        internalSelectedDataSources.value = internalSelectedDataSources.value.filter((x) => x.id !== ds.id)
+    } else {
+        internalSelectedDataSources.value = [...internalSelectedDataSources.value, ds]
+    }
+    handleSelectionChange()
+    // If we are in a report context, persist selection at report level immediately
+    persistSelectionIfReport()
+}
+
+onMounted(() => {
+    nextTick(async () => {
+        const { organization, ensureOrganization } = useOrganization()
+        
+        try {
+            // Wait for organization to be available before making API calls
+            await ensureOrganization()
+            
+            if (organization.value?.id) {
+                getDataSources()
+            } else {
+                console.warn('DataSourceSelectorComponentExcel: Organization not available, skipping API calls')
+            }
+        } catch (error) {
+            console.error('DataSourceSelectorComponentExcel: Error during initialization:', error)
+        }
+        // Setup resize observer for compact mode
+        // Look for the nearest parent container that's likely the prompt box
+        const findPromptContainer = () => {
+            let parent = containerRef.value?.parentElement
+            while (parent && parent.clientWidth < 300) {
+                parent = parent.parentElement
+            }
+            return parent || containerRef.value
+        }
+        
+        const ro = new ResizeObserver(() => {
+            const targetEl = findPromptContainer()
+            const w = targetEl?.clientWidth || 0
+            // Use a more reasonable threshold - compact if container is less than 420px
+            isCompact.value = w > 0 && w < 420
+        })
+        
+        // Observe the container initially, then try to find a better parent
+        if (containerRef.value) {
+            ro.observe(containerRef.value)
+            // Also try to observe a parent container after a short delay
+            setTimeout(() => {
+                const betterTarget = findPromptContainer()
+                if (betterTarget && betterTarget !== containerRef.value) {
+                    ro.unobserve(containerRef.value!)
+                    ro.observe(betterTarget)
+                }
+            }, 100)
+        }
+    })
+})
+// Keep internal selection in sync with parent-provided selectedDataSources
+watch(() => props.selectedDataSources, (newVal: any[]) => {
+    if (!Array.isArray(newVal)) return
+    const ids = new Set(newVal.map((x: any) => x.id))
+    // Map to known dataSources, or fall back to the raw objects if not present yet
+    const mapped = dataSources.value.length
+        ? dataSources.value.filter((ds: any) => ids.has(ds.id))
+        : newVal
+    internalSelectedDataSources.value = mapped as any
+}, { immediate: true, deep: true })
+
+async function persistSelectionIfReport() {
+    try {
+        if (!props.reportId) return
+        const ids = internalSelectedDataSources.value.map((x: any) => x.id)
+        await useMyFetch(`/reports/${props.reportId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data_sources: ids })
+        })
+    } catch (e) {
+        console.error('Failed to update report data sources:', e)
+    }
+}
+const dataTooltip = computed<string>(() => {
+    if (internalSelectedDataSources.value.length <= 1) return ''
+    const rest = internalSelectedDataSources.value.slice(1).map(s => s.name).join(', ')
+    return rest
+})
+
+</script>
