@@ -2,13 +2,11 @@
 
 backend/uploads/
 backend/db/
-backend/venv/
 backend/backend_venv/
-backend/.venv/
+backend/venv/
 backend/tests/integrations/integrations.json
 test_data_sources/
 excel-add-in/hi/node_modules/
-backend/tests/evals/spider_results.jsonl
 
 frontend/.nuxt/cache/
 # Nuxt dev/build outputs
@@ -22,6 +20,15 @@ frontend/node_modules/
 frontend/.output/
 frontend/test-results/
 frontend/tests/config/*.json
+
+# Custom frontend generated/vendor artifacts
+frontend-custom/node_modules/
+frontend-custom/.nuxt/
+frontend-custom/.output/
+frontend-custom/.data/
+frontend-custom/.cache/
+frontend-custom/dist/
+
 # Logs
 backend/logs
 *.log
@@ -34,10 +41,9 @@ backend/logs
 .env.*
 !.env.example
 
+# Generated reports
+reports/daily-sync/
+documents/alfastack-automation-context.latest.md
+
 
 *.pyc
-backend/alembic.ini
-backend/app.db
-
-# Sandbox session state (credentials, tokens, IDs)
-backend/sandbox_state.json

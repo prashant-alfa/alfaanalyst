@@ -23,7 +23,14 @@ smtp_settings:
 encryption_key: ${BOW_ENCRYPTION_KEY}
 
 intercom:
-  enabled: true
+  enabled: false
+  app_id: ${BOW_INTERCOM_APP_ID}
+
+telemetry:
+  enabled: false
+  provider: "posthog"
+  host: ${BOW_POSTHOG_HOST}
+  posthog_api_key: ${BOW_POSTHOG_API_KEY}
 
 database:
   url: ${BOW_DATABASE_URL}
